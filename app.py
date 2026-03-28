@@ -22,6 +22,7 @@ if st.button('🚀 Generate My Game Plan'):
             spy = yf.Ticker("SPY")
             spy_hist = spy.history(period="5d")
             current_price = round(spy_hist['Close'].iloc[-1], 2)
+            # THIS IS THE FIXED LINE:
             five_day_open = round(spy_hist['Open'].iloc, 2)
             trend = "Bullish/Up" if current_price > five_day_open else "Bearish/Down"
             
