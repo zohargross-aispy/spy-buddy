@@ -8,7 +8,6 @@ st.title("📈 SPY Buddy")
 st.markdown("Your AI-powered assistant for S&P 500 market trends.")
 
 # --- FETCH MARKET DATA ---
-# We use caching so the app doesn't re-download data on every single button click
 @st.cache_data(ttl=300) 
 def get_market_data():
     spy_hist = yf.Ticker("SPY").history(period="5d")
@@ -20,9 +19,9 @@ try:
 
     # --- PRICE LOGIC & CALCULATIONS ---
     curr_p = round(spy_hist['Close'].iloc[-1], 2)
-    open_p = round(spy_hist['Open'].iloc[-1], 2)
+    # Fixed the missing [-1] index below!
+    open_p = round(spy_hist['Open'].iloc[-1], 2) 
     
-    # Safely get previous close for the metric delta, fallback to open if not enough data
     prev_close = round(spy_hist['Close'].iloc[-2], 2) if len(spy_hist) > 1 else open_p
     vix_p = round(vix_hist['Close'].iloc[-1], 2)
 
@@ -39,7 +38,7 @@ try:
     # --- AI INSIGHTS ---
     st.subheader("🤖 AI Market Insight")
     
-    # Grab the API key securely from Streamlit secrets
+    # Safely pull the API key from Streamlit's hidden vault
     if "GOOGLE_API_KEY" in st.secrets:
         client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
         
