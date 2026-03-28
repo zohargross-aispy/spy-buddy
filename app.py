@@ -9,7 +9,6 @@ st.title("📈 SPY Buddy Pro (Live Edition)")
 st.markdown("Your AI-powered technical assistant for S&P 500 market trends.")
 
 # --- TIMEFRAME & REFRESH ---
-# FIXED: Added so Streamlit knows how wide to make the columns!
 col_tf, col_ref = st.columns() 
 with col_tf:
     timeframe = st.selectbox(
@@ -64,4 +63,12 @@ try:
     prev_close = round(spy_hist['Close'].iloc[-2], 2)
     vix_p = round(vix_hist['Close'].iloc[-1], 2)
     
-    sma20_p = round(spy_hist['SMA_20'].iloc[-1], 2)
+    sma20_p = round(spy_hist['SMA_20'].iloc[-1], 2) if not pd.isna(spy_hist['SMA_20'].iloc[-1]) else "N/A"
+    sma200_p = round(spy_hist['SMA_200'].iloc[-1], 2) if not pd.isna(spy_hist['SMA_200'].iloc[-1]) else "N/A"
+    rsi_p = round(spy_hist['RSI'].iloc[-1], 2) if not pd.isna(spy_hist['RSI'].iloc[-1]) else 50.0
+    vol_p = int(spy_hist['Volume'].iloc[-1])
+
+    trend = "Bullish 🐂" if curr_p > open_p else "Bearish 🐻"
+
+    # --- DISPLAY TOP METRICS ---
+    st.subheader(f"Market Overview ({timeframe} Chart)")
