@@ -66,4 +66,4 @@ if st.button('🚀 Generate My Game Plan'):
             # Show the raw news at the bottom for the user
             with st.expander("📰 Read Today's Raw Headlines"):
                 for entry in feed.entries[:5]:
-                    st.
+                st.write(f"- {entry.title}")
