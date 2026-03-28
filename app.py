@@ -19,7 +19,6 @@ try:
 
     # --- PRICE LOGIC & CALCULATIONS ---
     curr_p = round(spy_hist['Close'].iloc[-1], 2)
-    # Fixed the missing [-1] index below!
     open_p = round(spy_hist['Open'].iloc[-1], 2) 
     
     prev_close = round(spy_hist['Close'].iloc[-2], 2) if len(spy_hist) > 1 else open_p
@@ -29,16 +28,22 @@ try:
 
     # --- DISPLAY METRICS ---
     col1, col2, col3 = st.columns(3)
-    col1.metric("SPY Price", f"${curr_p}", f"{round(curr_p - prev_close, 2)}")
+    spy_delta = round(curr_p - prev_close, 2)
+    
+    # delta_color="normal" handles the red/green for the price change
+    col1.metric("SPY Price", f"${curr_p}", f"{spy_delta}", delta_color="normal")
     col2.metric("SPY Open", f"${open_p}")
     col3.metric("VIX (Volatility)", f"{vix_p}")
 
-    st.success(f"**Current Trend:** {trend}")
+    # This displays a Green (success) or Red (error) alert box based on trend
+    if "Bullish" in trend:
+        st.success(f"**Current Trend:** {trend}")
+    else:
+        st.error(f"**Current Trend:** {trend}")
 
     # --- AI INSIGHTS ---
     st.subheader("🤖 AI Market Insight")
     
-    # Safely pull the API key from Streamlit's hidden vault
     if "GOOGLE_API_KEY" in st.secrets:
         client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
         
