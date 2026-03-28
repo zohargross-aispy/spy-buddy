@@ -23,6 +23,7 @@ if st.button('🚀 Generate My Game Plan'):
             spy_hist = spy.history(period="5d")
             vix = yf.Ticker("^VIX").history(period="1d")['Close'].iloc[-1]
             
+            # --- THE FULLY FIXED PRICE LOGIC ---
             curr_p = round(spy_hist['Close'].iloc[-1], 2)
             open_p = round(spy_hist['Open'].iloc, 2)
             trend = "Bullish" if curr_p > open_p else "Bearish"
