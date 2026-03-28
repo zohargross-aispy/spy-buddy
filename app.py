@@ -1,5 +1,5 @@
 import streamlit as st
-import google.generativeai as genai
+from google import genai
 import yfinance as yf
 import feedparser
 from datetime import datetime
@@ -7,66 +7,44 @@ from datetime import datetime
 # --- 1. SETUP ---
 st.set_page_config(page_title="SPY Morning Buddy", page_icon="☀️", layout="centered")
 
-# Using your verified 'SPY BUDDY' key
+# Your verified AI Studio Key
 API_KEY = "AIzaSyBy5egrvlIOZ-BRYoCNdUkJDG01VZXFsbo"
-genai.configure(api_key=API_KEY)
+client = genai.Client(api_key=API_KEY)
 
-# --- 2. THE ADVANCED UI ---
-st.title("☀️ SPY Morning Buddy V2.0")
-st.write("Institutional Macro Game Plan")
+# --- 2. THE APP INTERFACE ---
+st.title("☀️ SPY Morning Buddy V3.0")
+st.write("2026 Institutional Macro Engine")
 
 if st.button('🚀 Generate My Game Plan'):
-    with st.spinner('Syncing with live market data & Gemini 3.1 Pro...'):
+    with st.spinner('Accessing Gemini 3.1 Pro...'):
         try:
-            # Fetch SPY Data (5 days for trend)
+            # Market Data Fetch
             spy = yf.Ticker("SPY")
             spy_hist = spy.history(period="5d")
+            vix = yf.Ticker("^VIX").history(period="1d")['Close'].iloc[-1]
             
-            # --- THE FULLY FIXED PRICE LOGIC ---
-            current_price = round(spy_hist['Close'].iloc[-1], 2)
-            five_day_open = round(spy_hist['Open'].iloc, 2)
-            trend = "Bullish/Up" if current_price > five_day_open else "Bearish/Down"
+            curr_p = round(spy_hist['Close'].iloc[-1], 2)
+            open_p = round(spy_hist['Open'].iloc, 2)
+            trend = "Bullish" if curr_p > open_p else "Bearish"
             
-            # Fetch VIX (Volatility/Fear Gauge)
-            vix = yf.Ticker("^VIX")
-            vix_price = round(vix.history(period="1d")['Close'].iloc[-1], 2)
-            
-            # Fetch News
-            feed = feedparser.parse("https://feeds.finance.yahoo.com/rss/2.0/headline?s=SPY")
-            news = " | ".join([entry.title for entry in feed.entries[:5]])
-            
-            # Get Today's Date
-            today = datetime.now().strftime("%A, %B %d, %Y")
-            
-            # --- DISPLAY DASHBOARD ---
-            col1, col2, col3 = st.columns(3)
-            col1.metric("SPY Price", f"${current_price}")
-            col2.metric("VIX (Volatility)", f"{vix_price}")
-            col3.metric("5-Day Trend", trend)
-            
-            # Add a sleek mini-chart to the app
-            st.write("**SPY 5-Day Price Action**")
+            # Dashboard
+            c1, c2, c3 = st.columns(3)
+            c1.metric("SPY", f"${curr_p}")
+            c2.metric("VIX", f"{round(vix, 2)}")
+            c3.metric("Trend", trend)
             st.line_chart(spy_hist['Close'])
+
+            # --- THE GENERATION (Using the New 3.1 Model) ---
+            prompt = f"Today is {datetime.now().strftime('%A, %B %d')}. SPY: ${curr_p}, VIX: {vix}. Analyze and provide a 0DTE trade plan with Bias, Levels, and Strategy."
             
-            # --- CONSULT THE AI ---
-            model = genai.GenerativeModel('gemini-3.1-pro-preview')
-            prompt = (
-                f"System: You are an elite Macro Strategist. Today is {today}. "
-                f"SPY Price: ${current_price}. 5-Day Trend is {trend}. "
-                f"The VIX is currently at {vix_price}. "
-                f"Recent News: {news}. "
-                f"Generate a highly accurate 0DTE trade plan. Include: 1. Daily Bias, 2. Macro Reasoning (factor in the VIX), 3. Key Levels, 4. Specific 0DTE Play."
+            # Note: Using the official 2026 model ID
+            response = client.models.generate_content(
+                model="gemini-3.1-pro",
+                contents=prompt
             )
-            
-            response = model.generate_content(prompt)
             
             st.markdown("### 📈 YOUR DAILY GAME PLAN")
             st.success(response.text)
-            
-            # Show the raw news at the bottom for the user
-            with st.expander("📰 Read Today's Raw Headlines"):
-                for entry in feed.entries[:5]:
-                    st.write(f"- {entry.title}")
             
         except Exception as e:
             st.error(f"Error: {e}")
