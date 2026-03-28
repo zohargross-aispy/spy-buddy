@@ -72,3 +72,60 @@ try:
 
     # --- DISPLAY TOP METRICS ---
     st.subheader(f"Market Overview ({timeframe} Chart)")
+    col1, col2, col3, col4 = st.columns(4)
+    spy_delta = round(curr_p - prev_close, 2)
+    
+    # Adjust labels dynamically
+    tf_label = timeframe.split().lower()
+    if tf_label == "day": tf_label = "day"
+    elif tf_label == "hour": tf_label = "hour"
+    else: tf_label = "period"
+
+    col1.metric("SPY Price", f"${curr_p}", f"{spy_delta} (vs prev {tf_label})", delta_color="normal")
+    col2.metric("RSI (14-period)", f"{rsi_p}", "Overbought (>70)" if rsi_p > 70 else "Oversold (<30)" if rsi_p < 30 else "Neutral", delta_color="off" if 30 <= rsi_p <= 70 else "inverse")
+    col3.metric("VIX (Volatility)", f"{vix_p}")
+    col4.metric(f"Volume (This {tf_label})", f"{vol_p:,}")
+
+    st.markdown(f"**Current Trend:** {trend} &nbsp;|&nbsp; **20-Period SMA:** ${sma20_p} &nbsp;|&nbsp; **200-Period SMA:** ${sma200_p}")
+
+    # --- CHARTS ---
+    st.subheader(f"📊 Price & Moving Averages (Last 90 {tf_label}s)")
+    chart_data = spy_hist[['Close', 'SMA_20', 'SMA_200']].tail(90)
+    st.line_chart(chart_data)
+    
+    st.subheader(f"📉 Volume (Last 90 {tf_label}s)")
+    vol_data = spy_hist[['Volume']].tail(90)
+    st.bar_chart(vol_data)
+
+    # --- AI INSIGHTS ---
+    st.subheader("🤖 AI Technical Analysis")
+    
+    if "GOOGLE_API_KEY" in st.secrets:
+        client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
+        
+        if st.button("Generate Expert Analysis"):
+            prompt = f"""
+            Act as an expert day trader. The SPY ETF is currently at ${curr_p}. 
+            We are looking at a {timeframe} chart timeframe.
+            Here is the current technical setup for this timeframe:
+            - Current Candle Open: ${open_p} ({trend})
+            - 20-Period SMA: ${sma20_p}
+            - 200-Period SMA: ${sma200_p}
+            - RSI (14): {rsi_p} (Overbought > 70, Oversold < 30)
+            - Volume for this {tf_label}: {vol_p:,} shares
+            - VIX (Volatility): {vix_p}
+
+            Based strictly on these technical indicators for a {timeframe} chart, give a concise, 3-sentence technical analysis of the current momentum and what a day trader should watch out for over the next few candles.
+            """
+            
+            with st.spinner("Analyzing intraday technicals..."):
+                response = client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=prompt
+                )
+                st.info(response.text)
+    else:
+        st.warning("⚠️ Google API Key not found. Please add it to your Streamlit secrets to use AI features.")
+
+except Exception as e:
+    st.error(f"Error fetching market data: {e}")
