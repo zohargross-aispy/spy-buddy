@@ -25,7 +25,7 @@ if st.button('🚀 Generate My Game Plan'):
             
             # --- THE FULLY FIXED PRICE LOGIC ---
             curr_p = round(spy_hist['Close'].iloc[-1], 2)
-            open_p = round(spy_hist['Open'].iloc, 2)
+            open_p = round (spy_hist ['Open' ] . iloc [0] , 2 )
             trend = "Bullish" if curr_p > open_p else "Bearish"
             
             # Dashboard
