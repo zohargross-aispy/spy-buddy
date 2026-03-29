@@ -1,8 +1,12 @@
+import json
+import urllib.request
+import urllib.error
+from typing import Tuple
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from typing import Tuple
 
 # Optional Plotly
 try:
@@ -12,7 +16,7 @@ try:
 except Exception:
     PLOTLY_AVAILABLE = False
 
-# Optional AI
+# Optional Gemini
 try:
     from google import genai
     GENAI_AVAILABLE = True
@@ -24,12 +28,12 @@ except Exception:
 # PAGE CONFIG
 # ----------------------------
 st.set_page_config(
-    page_title="SPY Buddy Pro 3.1",
+    page_title="SPY Buddy Pro Elite",
     page_icon="📈",
     layout="wide"
 )
 
-st.title("📈 SPY Buddy Pro 3.1")
+st.title("📈 SPY Buddy Pro Elite")
 st.caption("Research / education dashboard. Not financial advice.")
 
 
@@ -69,6 +73,29 @@ def signal_color(signal: str) -> str:
         "SELL": "red",
         "NO TRADE": "orange",
     }.get(signal, "gray")
+
+
+def send_webhook_alert(webhook_url: str, payload: dict) -> Tuple[bool, str]:
+    if not webhook_url:
+        return False, "Missing webhook URL"
+
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            webhook_url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            status = getattr(resp, "status", 200)
+        return True, f"HTTP {status}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTPError {e.code}"
+    except urllib.error.URLError as e:
+        return False, f"URLError {e.reason}"
+    except Exception as e:
+        return False, str(e)
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -133,7 +160,12 @@ def attach_daily_vix(df: pd.DataFrame, vix_df: pd.DataFrame) -> pd.DataFrame:
         temp.index = temp.index.tz_convert(None)
     temp["BAR_DATE"] = temp.index.normalize()
 
-    vix_map = vix[["Close", "VIX_DATE"]].drop_duplicates(subset="VIX_DATE").set_index("VIX_DATE")["Close"]
+    vix_map = (
+        vix[["Close", "VIX_DATE"]]
+        .drop_duplicates(subset="VIX_DATE")
+        .set_index("VIX_DATE")["Close"]
+    )
+
     temp["VIX_CLOSE"] = temp["BAR_DATE"].map(vix_map).ffill()
     temp.drop(columns=["BAR_DATE"], inplace=True)
     return temp
@@ -377,15 +409,48 @@ def find_chart_signals(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     marked = vector_signal_score(df.copy())
     marked["prev_signal"] = marked["signal_label"].shift(1)
 
-    buy_points = marked[
-        (marked["signal_label"] == "BUY") &
-        (marked["prev_signal"] != "BUY")
-    ].copy()
+    marked["fresh_buy"] = (marked["signal_label"] == "BUY") & (marked["prev_signal"] != "BUY")
+    marked["fresh_sell"] = (marked["signal_label"] == "SELL") & (marked["prev_signal"] != "SELL")
 
-    sell_points = marked[
-        (marked["signal_label"] == "SELL") &
-        (marked["prev_signal"] != "SELL")
-    ].copy()
+    buy_rows = []
+    sell_rows = []
+    open_trade = None
+
+    for idx, row in marked.iterrows():
+        if row["fresh_buy"]:
+            buy_label = f"BUY<br>{float(row['Close']):.2f}"
+            buy_rows.append({
+                "index": idx,
+                "Low": row["Low"],
+                "High": row["High"],
+                "ATR": row["ATR"],
+                "Close": row["Close"],
+                "label": buy_label,
+            })
+            open_trade = {
+                "index": idx,
+                "price": float(row["Close"]),
+            }
+
+        elif row["fresh_sell"]:
+            sell_label = f"SELL<br>{float(row['Close']):.2f}"
+
+            if open_trade is not None:
+                pnl_pct = ((float(row["Close"]) / open_trade["price"]) - 1.0) * 100.0
+                sell_label = f"SELL<br>{float(row['Close']):.2f}<br>{pnl_pct:+.2f}%"
+                open_trade = None
+
+            sell_rows.append({
+                "index": idx,
+                "Low": row["Low"],
+                "High": row["High"],
+                "ATR": row["ATR"],
+                "Close": row["Close"],
+                "label": sell_label,
+            })
+
+    buy_points = pd.DataFrame(buy_rows)
+    sell_points = pd.DataFrame(sell_rows)
 
     return buy_points, sell_points
 
@@ -480,6 +545,7 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str):
         specs=[[{"secondary_y": True}], [{}], [{}]]
     )
 
+    # Candles
     fig.add_trace(
         go.Candlestick(
             x=chart_df.index,
@@ -492,6 +558,7 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str):
         row=1, col=1, secondary_y=False
     )
 
+    # EMAs
     for col in ["EMA_8", "EMA_21", "EMA_50", "EMA_200"]:
         if col in chart_df.columns and chart_df[col].notna().sum() > 0:
             fig.add_trace(
@@ -504,6 +571,7 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str):
                 row=1, col=1, secondary_y=False
             )
 
+    # Volume
     fig.add_trace(
         go.Bar(
             x=chart_df.index,
@@ -514,6 +582,7 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str):
         row=1, col=1, secondary_y=True
     )
 
+    # RSI
     fig.add_trace(
         go.Scatter(
             x=chart_df.index,
@@ -526,6 +595,7 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str):
     fig.add_hline(y=70, row=2, col=1, line_dash="dot")
     fig.add_hline(y=30, row=2, col=1, line_dash="dot")
 
+    # MACD
     fig.add_trace(
         go.Scatter(
             x=chart_df.index,
@@ -556,43 +626,52 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str):
 
     # Buy / Sell arrows
     buy_points, sell_points = find_chart_signals(chart_df)
-    buy_points = buy_points.tail(20)
-    sell_points = sell_points.tail(20)
 
-    for idx, row in buy_points.iterrows():
-        y = row["Low"] - (row["ATR"] * 0.25 if pd.notna(row["ATR"]) else row["Low"] * 0.003)
+    if not buy_points.empty:
+        buy_points = buy_points.tail(20)
+    if not sell_points.empty:
+        sell_points = sell_points.tail(20)
+
+    for _, row in buy_points.iterrows():
+        x_val = row["index"]
+        y_val = row["Low"] - (row["ATR"] * 0.25 if pd.notna(row["ATR"]) else row["Low"] * 0.003)
+
         fig.add_annotation(
-            x=idx,
-            y=y,
+            x=x_val,
+            y=y_val,
             xref="x",
             yref="y",
-            text="BUY",
+            text=row["label"],
             showarrow=True,
             arrowhead=2,
             arrowsize=1.2,
             arrowwidth=2,
             arrowcolor="green",
             ax=0,
-            ay=30,
-            font=dict(color="green", size=10)
+            ay=38,
+            font=dict(color="green", size=10),
+            align="center"
         )
 
-    for idx, row in sell_points.iterrows():
-        y = row["High"] + (row["ATR"] * 0.25 if pd.notna(row["ATR"]) else row["High"] * 0.003)
+    for _, row in sell_points.iterrows():
+        x_val = row["index"]
+        y_val = row["High"] + (row["ATR"] * 0.25 if pd.notna(row["ATR"]) else row["High"] * 0.003)
+
         fig.add_annotation(
-            x=idx,
-            y=y,
+            x=x_val,
+            y=y_val,
             xref="x",
             yref="y",
-            text="SELL",
+            text=row["label"],
             showarrow=True,
             arrowhead=2,
             arrowsize=1.2,
             arrowwidth=2,
             arrowcolor="red",
             ax=0,
-            ay=-30,
-            font=dict(color="red", size=10)
+            ay=-42,
+            font=dict(color="red", size=10),
+            align="center"
         )
 
     fig.update_layout(
@@ -670,6 +749,16 @@ with st.sidebar:
     backtest_bars = st.slider("Bars to backtest", min_value=120, max_value=2000, value=500, step=20)
 
     st.divider()
+    st.subheader("Alerts")
+    enable_webhook = st.checkbox("Enable webhook alerts", value=False)
+    webhook_url = st.text_input(
+        "Webhook URL",
+        value="",
+        type="password",
+        help="Paste a Discord, Slack-compatible, or automation webhook URL."
+    )
+
+    st.divider()
     show_ai = st.checkbox("Enable AI panel", value=True)
 
     if st.button("🔄 Refresh Data", use_container_width=True):
@@ -710,7 +799,7 @@ try:
 
     sig = current_signal(entry_df, hourly_df, daily_df, vix_value)
 
-    # Alert logic
+    # Alerts
     alert_key = f"last_signal_{symbol}_{timeframe}"
     history_key = f"alert_history_{symbol}_{timeframe}"
 
@@ -721,16 +810,58 @@ try:
 
     if prev_signal is None:
         st.session_state[alert_key] = sig["signal"]
+
     elif prev_signal != sig["signal"]:
-        st.session_state[history_key].insert(0, {
-            "Time": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+        event_time = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        alert_row = {
+            "Time": event_time,
             "Old Signal": prev_signal,
             "New Signal": sig["signal"],
             "Price": curr_price,
-        })
+            "Ticker": symbol,
+            "Timeframe": timeframe,
+            "Confidence": sig["confidence"],
+            "Risk": sig["risk"],
+        }
+
+        st.session_state[history_key].insert(0, alert_row)
         st.session_state[alert_key] = sig["signal"]
+
         st.warning(f"Signal changed: {prev_signal} → {sig['signal']} at {fmt_price(curr_price)}")
 
+        toast_icon = {
+            "BUY": "🟢",
+            "HOLD": "🔵",
+            "SELL": "🔴",
+            "NO TRADE": "🟠"
+        }.get(sig["signal"], "📈")
+
+        st.toast(
+            f"{symbol} {timeframe}: {prev_signal} → {sig['signal']} at {fmt_price(curr_price)}",
+            icon=toast_icon
+        )
+
+        if enable_webhook and webhook_url:
+            payload = {
+                "text": (
+                    f"{symbol} {timeframe} signal changed: "
+                    f"{prev_signal} -> {sig['signal']} | "
+                    f"Price: {curr_price} | "
+                    f"Confidence: {sig['confidence']}% | "
+                    f"Risk: {sig['risk']} | "
+                    f"Regime: {sig['regime']}"
+                )
+            }
+
+            ok, msg = send_webhook_alert(webhook_url, payload)
+
+            if ok:
+                st.toast("Webhook alert sent", icon="✅")
+            else:
+                st.toast(f"Webhook failed: {msg}", icon="❌")
+
+    # Header
     st.subheader(f"Signal: :{signal_color(sig['signal'])}[{sig['signal']}]")
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
