@@ -1,7 +1,7 @@
 import streamlit as st
 import yfinance as yf
-    from google import genai
-    import pandas as pd
+from google import genai
+import pandas as pd
     
     st.set_page_config(page_title="SPY Buddy PRO", page_icon="📈", layout="wide")
     st.title("📈 SPY Buddy Pro (Algo Edition)")
