@@ -1,5 +1,5 @@
 import streamlit as st
-    import yfinance as yf
+import yfinance as yf
     from google import genai
     import pandas as pd
     
