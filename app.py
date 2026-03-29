@@ -6,7 +6,7 @@ import pandas as pd
 st.set_page_config(page_title="SPY Buddy PRO", page_icon="📈", layout="wide")
 st.title("📈 SPY Buddy Pro (Algo Edition)")
 
-col_tf, col_ref = st.columns() 
+'col_tf, col_ref = st.columns([3, 1])'
 with col_tf:
     timeframe = st.selectbox("Chart Timeframe", ["1 Day", "1 Hour", "15 Min", "5 Min", "1 Min"], index=0)
 with col_ref:
