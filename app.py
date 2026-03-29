@@ -2,8 +2,15 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from typing import Tuple
+
+# Optional Plotly
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    PLOTLY_AVAILABLE = True
+except Exception:
+    PLOTLY_AVAILABLE = False
 
 # Optional AI
 try:
@@ -17,12 +24,12 @@ except Exception:
 # PAGE CONFIG
 # ----------------------------
 st.set_page_config(
-    page_title="SPY Buddy Pro 3.0",
+    page_title="SPY Buddy Pro 3.1",
     page_icon="📈",
     layout="wide"
 )
 
-st.title("📈 SPY Buddy Pro 3.0")
+st.title("📈 SPY Buddy Pro 3.1")
 st.caption("Research / education dashboard. Not financial advice.")
 
 
@@ -108,13 +115,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def normalize_index_to_date(idx):
-    ts = pd.to_datetime(idx)
-    if getattr(ts, "tz", None) is not None:
-        ts = ts.tz_convert(None)
-    return pd.Series(ts).dt.normalize().values
-
-
 def attach_daily_vix(df: pd.DataFrame, vix_df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     if df.empty or vix_df.empty:
@@ -146,26 +146,15 @@ def timeframe_bias(df: pd.DataFrame) -> int:
     row = df.iloc[-1]
     score = 0
 
-    if row["Close"] > row["EMA_21"]:
-        score += 1
-    else:
-        score -= 1
-
-    if row["EMA_21"] > row["EMA_50"]:
-        score += 1
-    else:
-        score -= 1
+    score += 1 if row["Close"] > row["EMA_21"] else -1
+    score += 1 if row["EMA_21"] > row["EMA_50"] else -1
 
     if row["RSI"] > 52:
         score += 1
     elif row["RSI"] < 45:
         score -= 1
 
-    if row["MACD_HIST"] > 0:
-        score += 1
-    else:
-        score -= 1
-
+    score += 1 if row["MACD_HIST"] > 0 else -1
     return score
 
 
@@ -348,33 +337,25 @@ def vector_signal_score(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["score"] = 0
 
-    # Trend
     out["score"] += np.where(out["Close"] > out["EMA_21"], 1, -1)
     out["score"] += np.where(out["EMA_21"] > out["EMA_50"], 1, -1)
     out["score"] += np.where(out["EMA_50"] > out["EMA_200"], 1, -1)
 
-    # RSI
     out["score"] += np.where((out["RSI"] >= 52) & (out["RSI"] <= 68), 1, 0)
     out["score"] += np.where(out["RSI"] < 45, -1, 0)
     out["score"] += np.where(out["RSI"] > 72, -1, 0)
 
-    # MACD
     out["score"] += np.where(out["MACD_HIST"] > 0, 1, -1)
-
-    # Volume
     out["score"] += np.where(out["Volume"] > out["VOL_AVG_20"], 1, 0)
 
-    # VIX
     if "VIX_CLOSE" in out.columns:
         out["score"] += np.where(out["VIX_CLOSE"] < 18, 1, 0)
         out["score"] += np.where(out["VIX_CLOSE"] > 24, -2, 0)
 
-    # Extended filter
     atr_dist = abs(out["Close"] - out["EMA_21"]) / out["ATR"].replace(0, np.nan)
     out["extended"] = atr_dist > 1.8
     out["score"] += np.where(out["extended"], -1, 0)
 
-    # Labels
     out["signal_label"] = np.select(
         [
             out["score"] >= 6,
@@ -392,6 +373,23 @@ def vector_signal_score(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def find_chart_signals(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    marked = vector_signal_score(df.copy())
+    marked["prev_signal"] = marked["signal_label"].shift(1)
+
+    buy_points = marked[
+        (marked["signal_label"] == "BUY") &
+        (marked["prev_signal"] != "BUY")
+    ].copy()
+
+    sell_points = marked[
+        (marked["signal_label"] == "SELL") &
+        (marked["prev_signal"] != "SELL")
+    ].copy()
+
+    return buy_points, sell_points
+
+
 def run_backtest(df: pd.DataFrame):
     bt = df.copy()
     bt = vector_signal_score(bt)
@@ -400,7 +398,6 @@ def run_backtest(df: pd.DataFrame):
     if bt.empty or len(bt) < 50:
         return None, None
 
-    # Long-only state machine
     position = []
     in_pos = 0
 
@@ -417,18 +414,14 @@ def run_backtest(df: pd.DataFrame):
         position.append(in_pos)
 
     bt["position"] = position
-
-    # Use previous bar position to avoid lookahead
     bt["ret"] = bt["Close"].pct_change().fillna(0)
     bt["strategy_ret"] = bt["ret"] * bt["position"].shift(1).fillna(0)
     bt["equity_curve"] = (1 + bt["strategy_ret"]).cumprod()
     bt["buy_hold_curve"] = (1 + bt["ret"]).cumprod()
 
-    # Drawdown
     bt["equity_peak"] = bt["equity_curve"].cummax()
     bt["drawdown"] = bt["equity_curve"] / bt["equity_peak"] - 1
 
-    # Trades
     bt["position_change"] = bt["position"].diff().fillna(0)
     entries = bt.index[bt["position_change"] == 1].tolist()
     exits = bt.index[bt["position_change"] == -1].tolist()
@@ -487,7 +480,6 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str):
         specs=[[{"secondary_y": True}], [{}], [{}]]
     )
 
-    # Candles
     fig.add_trace(
         go.Candlestick(
             x=chart_df.index,
@@ -500,7 +492,6 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str):
         row=1, col=1, secondary_y=False
     )
 
-    # EMAs
     for col in ["EMA_8", "EMA_21", "EMA_50", "EMA_200"]:
         if col in chart_df.columns and chart_df[col].notna().sum() > 0:
             fig.add_trace(
@@ -513,7 +504,6 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str):
                 row=1, col=1, secondary_y=False
             )
 
-    # Volume
     fig.add_trace(
         go.Bar(
             x=chart_df.index,
@@ -524,7 +514,6 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str):
         row=1, col=1, secondary_y=True
     )
 
-    # RSI
     fig.add_trace(
         go.Scatter(
             x=chart_df.index,
@@ -537,7 +526,6 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str):
     fig.add_hline(y=70, row=2, col=1, line_dash="dot")
     fig.add_hline(y=30, row=2, col=1, line_dash="dot")
 
-    # MACD
     fig.add_trace(
         go.Scatter(
             x=chart_df.index,
@@ -566,11 +554,53 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str):
         row=3, col=1
     )
 
+    # Buy / Sell arrows
+    buy_points, sell_points = find_chart_signals(chart_df)
+    buy_points = buy_points.tail(20)
+    sell_points = sell_points.tail(20)
+
+    for idx, row in buy_points.iterrows():
+        y = row["Low"] - (row["ATR"] * 0.25 if pd.notna(row["ATR"]) else row["Low"] * 0.003)
+        fig.add_annotation(
+            x=idx,
+            y=y,
+            xref="x",
+            yref="y",
+            text="BUY",
+            showarrow=True,
+            arrowhead=2,
+            arrowsize=1.2,
+            arrowwidth=2,
+            arrowcolor="green",
+            ax=0,
+            ay=30,
+            font=dict(color="green", size=10)
+        )
+
+    for idx, row in sell_points.iterrows():
+        y = row["High"] + (row["ATR"] * 0.25 if pd.notna(row["ATR"]) else row["High"] * 0.003)
+        fig.add_annotation(
+            x=idx,
+            y=y,
+            xref="x",
+            yref="y",
+            text="SELL",
+            showarrow=True,
+            arrowhead=2,
+            arrowsize=1.2,
+            arrowwidth=2,
+            arrowcolor="red",
+            ax=0,
+            ay=-30,
+            font=dict(color="red", size=10)
+        )
+
     fig.update_layout(
         title=f"{symbol} Candlestick + EMA / RSI / MACD",
         xaxis_rangeslider_visible=False,
         height=900,
-        legend_orientation="h"
+        legend_orientation="h",
+        dragmode="zoom"
     )
 
     fig.update_yaxes(title_text="Price", row=1, col=1, secondary_y=False)
@@ -582,21 +612,19 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str):
 
 
 def make_backtest_chart(bt_df: pd.DataFrame):
-    chart_df = bt_df.copy()
-
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
-            x=chart_df.index,
-            y=chart_df["equity_curve"],
+            x=bt_df.index,
+            y=bt_df["equity_curve"],
             mode="lines",
             name="Strategy"
         )
     )
     fig.add_trace(
         go.Scatter(
-            x=chart_df.index,
-            y=chart_df["buy_hold_curve"],
+            x=bt_df.index,
+            y=bt_df["buy_hold_curve"],
             mode="lines",
             name="Buy & Hold"
         )
@@ -650,7 +678,7 @@ with st.sidebar:
 
 
 # ----------------------------
-# LOAD DATA
+# MAIN
 # ----------------------------
 try:
     entry_raw, hourly_raw, daily_raw, vix_raw = get_all_data(symbol, timeframe)
@@ -682,9 +710,7 @@ try:
 
     sig = current_signal(entry_df, hourly_df, daily_df, vix_value)
 
-    # ----------------------------
-    # ALERT LOGIC
-    # ----------------------------
+    # Alert logic
     alert_key = f"last_signal_{symbol}_{timeframe}"
     history_key = f"alert_history_{symbol}_{timeframe}"
 
@@ -705,9 +731,6 @@ try:
         st.session_state[alert_key] = sig["signal"]
         st.warning(f"Signal changed: {prev_signal} → {sig['signal']} at {fmt_price(curr_price)}")
 
-    # ----------------------------
-    # HEADER METRICS
-    # ----------------------------
     st.subheader(f"Signal: :{signal_color(sig['signal'])}[{sig['signal']}]")
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -724,9 +747,6 @@ try:
     d3.metric("Stop", fmt_price(safe_round(sig["stop"], 2)))
     d4.metric("Target", fmt_price(safe_round(sig["target"], 2)))
 
-    # ----------------------------
-    # TABS
-    # ----------------------------
     tab1, tab2, tab3, tab4 = st.tabs(["Dashboard", "Backtest", "Alerts", "Raw Data"])
 
     with tab1:
@@ -756,8 +776,25 @@ try:
                 """
             )
 
-        fig = make_candlestick_chart(entry_df, symbol)
-        st.plotly_chart(fig, use_container_width=True)
+        st.subheader(f"{symbol} Chart")
+
+        if PLOTLY_AVAILABLE:
+            fig = make_candlestick_chart(entry_df, symbol)
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+                config={
+                    "scrollZoom": True,
+                    "displaylogo": False
+                }
+            )
+            st.caption("Use your mouse wheel to zoom. You can also box-zoom, pan, and double-click to reset.")
+        else:
+            st.warning("Plotly is not installed, so showing a simpler chart without arrows.")
+            fallback_cols = ["Close", "EMA_8", "EMA_21", "EMA_50"]
+            if "EMA_200" in entry_df.columns and entry_df["EMA_200"].notna().sum() > 0:
+                fallback_cols.append("EMA_200")
+            st.line_chart(entry_df[fallback_cols].tail(150))
 
         left, right = st.columns([1.2, 1])
 
@@ -858,7 +895,17 @@ Suggested target: {safe_round(sig['target'], 2)}
             b5.metric("Win Rate", f"{s['Win Rate %']}%")
             b6.metric("Avg Trade", f"{s['Avg Trade %']}%")
 
-            st.plotly_chart(make_backtest_chart(bt_df), use_container_width=True)
+            if PLOTLY_AVAILABLE:
+                st.plotly_chart(
+                    make_backtest_chart(bt_df),
+                    use_container_width=True,
+                    config={
+                        "scrollZoom": True,
+                        "displaylogo": False
+                    }
+                )
+            else:
+                st.line_chart(bt_df[["equity_curve", "buy_hold_curve"]])
 
             with st.expander("Backtest trade log"):
                 trades_df = bt_result["trades"]
