@@ -6,7 +6,7 @@ import pandas as pd
 st.set_page_config(page_title="SPY Buddy PRO", page_icon="📈", layout="wide")
 st.title("📈 SPY Buddy Pro (Algo Edition)")
 
-col_tf, col_ref = st.columns([3, 1])
+col_tf, col_ref = st.columns() 
 with col_tf:
     timeframe = st.selectbox("Chart Timeframe", ["1 Day", "1 Hour", "15 Min", "5 Min", "1 Min"], index=0)
 with col_ref:
@@ -57,8 +57,8 @@ try:
         if st.button("Run Deep Analysis"):
             prompt = f"SPY ${curr_p}, 20SMA ${sma20_p}, RSI {rsi_p}, VIX {vix_p}. Act as a hedge fund lead. Give a 3-sentence high-conviction verdict for {timeframe} traders."
             with st.spinner("Processing..."):
-             client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
-response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
-st.info(response.text)  
+                client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
+                response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+                st.info(response.text)
 except Exception as e:
     st.error(f"Error: {e}")
