@@ -6,7 +6,7 @@ import pandas as pd
 st.set_page_config(page_title="SPY Buddy PRO", page_icon="📈", layout="wide")
 st.title("📈 SPY Buddy Pro (Algo Edition)")
 
-'col_tf, col_ref = st.columns([3, 1])'
+col_tf, col_ref = st.columns() 
 with col_tf:
     timeframe = st.selectbox("Chart Timeframe", ["1 Day", "1 Hour", "15 Min", "5 Min", "1 Min"], index=0)
 with col_ref:
@@ -24,6 +24,7 @@ try:
     spy_hist, vix_hist = get_market_data(period, interval)
     spy_hist['SMA_20'] = spy_hist['Close'].rolling(window=20).mean()
     spy_hist['SMA_200'] = spy_hist['Close'].rolling(window=200).mean()
+    
     delta = spy_hist['Close'].diff()
     up, down = delta.clip(lower=0), -1 * delta.clip(upper=0)
     rs = up.ewm(com=13, adjust=False).mean() / down.ewm(com=13, adjust=False).mean()
