@@ -1,987 +1,1058 @@
-import math
-from typing import Any, Dict, Optional
+"""
+SPY Buddy Pro Elite
+====================
+Real-time trading signal dashboard powered by Alpaca Markets data.
+Set ALPACA_API_KEY and ALPACA_SECRET_KEY in Streamlit secrets or as
+environment variables before running.
 
+Not financial advice.
+"""
+
+import json
+import os
+import urllib.request
+import urllib.error
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Tuple
+
+import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-import requests
 import streamlit as st
 
-st.set_page_config(page_title="SPY Buddy Options V2", page_icon="🎯", layout="wide")
-st.title("🎯 SPY Buddy Options V2")
-st.caption("Position-aware options manager with locked entry, TP/SL tracking, chart, live P&L, and news.")
+# ---------------------------------------------------------------------------
+# Optional heavy imports
+# ---------------------------------------------------------------------------
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
 
-ALPACA_KEY = st.secrets.get("ALPACA_API_KEY", "")
-ALPACA_SECRET = st.secrets.get("ALPACA_SECRET_KEY", "")
+try:
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+    ALPACA_SDK_AVAILABLE = True
+except ImportError:
+    ALPACA_SDK_AVAILABLE = False
 
-PAPER_BASE = "https://paper-api.alpaca.markets"
-DATA_BASE = "https://data.alpaca.markets"
+try:
+    from google import genai
+    GENAI_AVAILABLE = True
+except ImportError:
+    GENAI_AVAILABLE = False
+
+
+# ---------------------------------------------------------------------------
+# PAGE CONFIG  (must be first Streamlit call)
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="SPY Buddy Pro Elite",
+    page_icon="📈",
+    layout="wide",
+)
+
+
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
+ALPACA_DATA_URL = "https://data.alpaca.markets"
+
+TF_MAP: Dict[str, Dict[str, Any]] = {
+    "1 Day":  {"amount": 1,  "unit": "Day",    "limit": 500,  "period_days": 730},
+    "1 Hour": {"amount": 1,  "unit": "Hour",   "limit": 1000, "period_days": 60},
+    "15 Min": {"amount": 15, "unit": "Minute", "limit": 1000, "period_days": 30},
+    "5 Min":  {"amount": 5,  "unit": "Minute", "limit": 1000, "period_days": 15},
+    "1 Min":  {"amount": 1,  "unit": "Minute", "limit": 1000, "period_days": 7},
+}
 
 DEFAULT_SYMBOL = "SPY"
 
 
-# ----------------------------
-# API HELPERS
-# ----------------------------
-def headers() -> Dict[str, str]:
-    return {
-        "APCA-API-KEY-ID": ALPACA_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET,
-        "accept": "application/json",
-    }
+# ---------------------------------------------------------------------------
+# CREDENTIAL HELPERS
+# ---------------------------------------------------------------------------
+def get_alpaca_keys() -> Tuple[Optional[str], Optional[str]]:
+    """Return (api_key, secret_key) from Streamlit secrets or env vars."""
+    api_key = None
+    secret_key = None
 
-
-def api_get(url: str, params: Optional[dict] = None) -> dict:
-    r = requests.get(url, headers=headers(), params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-
-def api_post(url: str, payload: dict) -> dict:
-    r = requests.post(
-        url,
-        headers={**headers(), "content-type": "application/json"},
-        json=payload,
-        timeout=20,
-    )
-    r.raise_for_status()
-    return r.json()
-
-
-# ----------------------------
-# FORMATTERS
-# ----------------------------
-def fmt_money(x: Any) -> str:
+    # Try Streamlit secrets first
     try:
-        if x is None or (isinstance(x, float) and math.isnan(x)):
-            return "N/A"
-        return f"${float(x):,.2f}"
+        api_key = st.secrets.get("ALPACA_API_KEY") or st.secrets.get("alpaca_api_key")
+        secret_key = st.secrets.get("ALPACA_SECRET_KEY") or st.secrets.get("alpaca_secret_key")
     except Exception:
-        return "N/A"
+        pass
+
+    # Fall back to environment variables
+    if not api_key:
+        api_key = os.environ.get("ALPACA_API_KEY")
+    if not secret_key:
+        secret_key = os.environ.get("ALPACA_SECRET_KEY")
+
+    return api_key, secret_key
 
 
-def fmt_num(x: Any, digits: int = 2) -> str:
+def get_gemini_key() -> Optional[str]:
+    """Return Gemini API key from Streamlit secrets or env vars."""
     try:
-        if x is None or (isinstance(x, float) and math.isnan(x)):
-            return "N/A"
-        return f"{float(x):.{digits}f}"
+        key = st.secrets.get("GEMINI_API_KEY") or st.secrets.get("GOOGLE_API_KEY")
+        if key:
+            return key
     except Exception:
-        return "N/A"
+        pass
+    return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 
 
-def safe_get(d: dict, *path, default=None):
-    cur = d
-    for key in path:
-        if not isinstance(cur, dict) or key not in cur:
-            return default
-        cur = cur[key]
-    return cur
+# ---------------------------------------------------------------------------
+# DATA FETCHING  (Alpaca primary, yfinance fallback)
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=60)
+def fetch_alpaca_bars(
+    symbol: str,
+    timeframe_label: str,
+    api_key: str,
+    secret_key: str,
+) -> pd.DataFrame:
+    """
+    Fetch OHLCV bars from Alpaca using the official SDK.
+    Falls back to yfinance if the SDK is unavailable or the request fails.
+    """
+    cfg = TF_MAP[timeframe_label]
 
+    if ALPACA_SDK_AVAILABLE and api_key and secret_key:
+        try:
+            client = StockHistoricalDataClient(api_key, secret_key)
 
-def state_color(state: str) -> str:
-    return {
-        "ENTER CALL": "green",
-        "ENTER PUT": "red",
-        "HOLD CALL": "blue",
-        "HOLD PUT": "blue",
-        "TP1 HIT": "violet",
-        "WEAKENING": "orange",
-        "EXIT CALL": "orange",
-        "EXIT PUT": "orange",
-        "NO TRADE": "gray",
-    }.get(state, "gray")
+            unit_map = {
+                "Day":    TimeFrame(1, TimeFrameUnit.Day),
+                "Hour":   TimeFrame(1, TimeFrameUnit.Hour),
+                "Minute": TimeFrame(cfg["amount"], TimeFrameUnit.Minute),
+            }
+            tf = unit_map[cfg["unit"]]
 
+            start = datetime.now(timezone.utc) - timedelta(days=cfg["period_days"])
 
-# ----------------------------
-# POSITION MEMORY
-# ----------------------------
-if "active_trade" not in st.session_state:
-    st.session_state.active_trade = None
+            request = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=tf,
+                start=start,
+                limit=cfg["limit"],
+                feed="iex",          # free IEX feed; change to "sip" for paid
+            )
 
+            bars = client.get_stock_bars(request)
+            df = bars.df
 
-def save_active_trade(trade: dict):
-    st.session_state.active_trade = trade
+            if df is None or df.empty:
+                raise ValueError("Empty response from Alpaca")
 
+            # Alpaca SDK returns a MultiIndex (symbol, timestamp) — flatten it
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.xs(symbol, level="symbol")
 
-def clear_active_trade():
-    st.session_state.active_trade = None
+            df.index = pd.to_datetime(df.index)
+            if df.index.tz is not None:
+                df.index = df.index.tz_convert("America/New_York")
 
+            df.rename(columns={
+                "open": "Open", "high": "High", "low": "Low",
+                "close": "Close", "volume": "Volume",
+            }, inplace=True)
 
-def active_trade_matches(contract_symbol: Optional[str]) -> bool:
-    t = st.session_state.active_trade
-    return bool(t and contract_symbol and t.get("contract_symbol") == contract_symbol)
+            df = df[~df.index.duplicated(keep="last")]
+            return df[["Open", "High", "Low", "Close", "Volume"]]
 
+        except Exception as e:
+            st.warning(f"Alpaca fetch failed ({e}). Falling back to yfinance.")
 
-# ----------------------------
-# ALPACA DATA
-# ----------------------------
-@st.cache_data(ttl=20)
-def get_stock_snapshot(symbol: str) -> dict:
-    return api_get(f"{DATA_BASE}/v2/stocks/{symbol}/snapshot")
+    # ---- yfinance fallback ------------------------------------------------
+    try:
+        import yfinance as yf
 
+        yf_interval_map = {
+            "1 Day":  ("2y",  "1d"),
+            "1 Hour": ("60d", "1h"),
+            "15 Min": ("60d", "15m"),
+            "5 Min":  ("60d", "5m"),
+            "1 Min":  ("7d",  "1m"),
+        }
+        period, interval = yf_interval_map[timeframe_label]
+        df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
 
-@st.cache_data(ttl=30)
-def get_stock_bars(symbol: str, timeframe: str = "5Min", limit: int = 120) -> pd.DataFrame:
-    payload = api_get(
-        f"{DATA_BASE}/v2/stocks/bars",
-        params={
-            "symbols": symbol.upper(),
-            "timeframe": timeframe,
-            "limit": limit,
-            "adjustment": "raw",
-            "feed": "iex",
-            "sort": "asc",
-        },
-    )
-    bars = payload.get("bars", {}).get(symbol.upper(), [])
-    if not bars:
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        df = df[~df.index.duplicated(keep="last")]
+        return df[["Open", "High", "Low", "Close", "Volume"]]
+
+    except Exception as e:
+        st.error(f"Both Alpaca and yfinance failed: {e}")
         return pd.DataFrame()
-
-    df = pd.DataFrame(bars)
-    df["Time"] = pd.to_datetime(df["t"], utc=True).dt.tz_convert("America/New_York")
-    df = df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
-    return df[["Time", "Open", "High", "Low", "Close", "Volume"]]
 
 
 @st.cache_data(ttl=60)
-def get_option_contracts(symbol: str, expiration_date: Optional[str], option_type: Optional[str]) -> list:
-    params = {
-        "underlying_symbols": symbol.upper(),
-        "status": "active",
-        "limit": 1000,
-    }
-    if expiration_date:
-        params["expiration_date"] = expiration_date
-    if option_type:
-        params["type"] = option_type.lower()
-    payload = api_get(f"{PAPER_BASE}/v2/options/contracts", params=params)
-    return payload.get("option_contracts", [])
-
-
-@st.cache_data(ttl=20)
-def get_option_snapshot(contract_symbol: str) -> dict:
-    payload = api_get(
-        f"{DATA_BASE}/v1beta1/options/snapshots",
-        params={"symbols": contract_symbol},
-    )
-    return payload.get("snapshots", {}).get(contract_symbol, {})
-
-
-@st.cache_data(ttl=30)
-def get_news(symbols: str, limit: int = 8) -> list:
-    payload = api_get(
-        f"{DATA_BASE}/v1beta1/news",
-        params={"symbols": symbols, "limit": limit, "sort": "desc"},
-    )
-    return payload.get("news", [])
-
-
-def get_open_positions() -> list:
+def fetch_vix(api_key: str, secret_key: str) -> pd.DataFrame:
+    """Fetch VIX daily bars (always uses yfinance — Alpaca doesn't carry VIX)."""
     try:
-        return api_get(f"{PAPER_BASE}/v2/positions")
+        import yfinance as yf
+        df = yf.Ticker("^VIX").history(period="6mo", interval="1d", auto_adjust=False)
+        if df is not None and not df.empty:
+            return df[~df.index.duplicated(keep="last")]
     except Exception:
-        return []
+        pass
+    return pd.DataFrame()
 
 
-def find_position(symbol: str) -> Optional[dict]:
-    for p in get_open_positions():
-        if p.get("symbol") == symbol:
-            return p
-    return None
+@st.cache_data(ttl=60)
+def fetch_latest_quote(symbol: str, api_key: str, secret_key: str) -> Optional[float]:
+    """
+    Fetch the latest trade price from Alpaca REST directly.
+    Returns None if unavailable.
+    """
+    if not (api_key and secret_key):
+        return None
+    try:
+        url = f"https://data.alpaca.markets/v2/stocks/{symbol}/trades/latest?feed=iex"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "APCA-API-KEY-ID": api_key,
+                "APCA-API-SECRET-KEY": secret_key,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        return float(data["trade"]["p"])
+    except Exception:
+        return None
 
 
-def place_option_order(symbol: str, qty: int, side: str, order_type: str = "market", limit_price: Optional[float] = None) -> dict:
-    payload: Dict[str, Any] = {
-        "symbol": symbol,
-        "qty": str(qty),
-        "side": side,
-        "type": order_type,
-        "time_in_force": "day",
-    }
-    if order_type == "limit" and limit_price is not None:
-        payload["limit_price"] = str(limit_price)
-    return api_post(f"{PAPER_BASE}/v2/orders", payload)
+# ---------------------------------------------------------------------------
+# TECHNICAL INDICATORS
+# ---------------------------------------------------------------------------
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate EMA, RSI, MACD, ATR, and volume average."""
+    df = df.copy()
+    if df.empty:
+        return df
 
+    # EMAs
+    for span in [8, 21, 50, 200]:
+        df[f"EMA_{span}"] = df["Close"].ewm(span=span, adjust=False).mean()
 
-# ----------------------------
-# SIGNALS / QUALITY
-# ----------------------------
-def add_underlying_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if out.empty:
-        return out
-
-    out["EMA_8"] = out["Close"].ewm(span=8, adjust=False).mean()
-    out["EMA_21"] = out["Close"].ewm(span=21, adjust=False).mean()
-    out["EMA_50"] = out["Close"].ewm(span=50, adjust=False).mean()
-
-    delta = out["Close"].diff()
+    # RSI (14)
+    delta = df["Close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
-    out["RSI"] = 100 - (100 / (1 + rs))
-    return out
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    # MACD (12/26/9)
+    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema12 - ema26
+    df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
+
+    # ATR (14)
+    hl  = df["High"] - df["Low"]
+    hpc = (df["High"] - df["Close"].shift()).abs()
+    lpc = (df["Low"]  - df["Close"].shift()).abs()
+    tr  = pd.concat([hl, hpc, lpc], axis=1).max(axis=1)
+    df["ATR"] = tr.rolling(14).mean()
+
+    # Volume average (20 bars)
+    df["VOL_AVG_20"] = df["Volume"].rolling(20).mean() if "Volume" in df.columns else np.nan
+
+    return df
 
 
-def stock_signal(df: pd.DataFrame) -> tuple[str, int, list]:
-    if df.empty or len(df) < 30:
-        return "NO TRADE", 0, ["Not enough bar data."]
+def attach_daily_vix(df: pd.DataFrame, vix_df: pd.DataFrame) -> pd.DataFrame:
+    """Merge daily VIX close onto any timeframe dataframe."""
+    df = df.copy()
+    if df.empty or vix_df.empty:
+        df["VIX_CLOSE"] = np.nan
+        return df
 
+    vix = vix_df.copy()
+    vix.index = pd.to_datetime(vix.index)
+    if getattr(vix.index, "tz", None) is not None:
+        vix.index = vix.index.tz_convert(None)
+    vix["VIX_DATE"] = vix.index.normalize()
+
+    temp = df.copy()
+    temp.index = pd.to_datetime(temp.index)
+    if getattr(temp.index, "tz", None) is not None:
+        temp.index = temp.index.tz_convert(None)
+    temp["BAR_DATE"] = temp.index.normalize()
+
+    vix_map = (
+        vix[["Close", "VIX_DATE"]]
+        .drop_duplicates(subset="VIX_DATE")
+        .set_index("VIX_DATE")["Close"]
+    )
+    temp["VIX_CLOSE"] = temp["BAR_DATE"].map(vix_map).ffill()
+    temp.drop(columns=["BAR_DATE"], inplace=True)
+    return temp
+
+
+# ---------------------------------------------------------------------------
+# SIGNAL ENGINE
+# ---------------------------------------------------------------------------
+def safe_round(x: Any, digits: int = 2) -> Optional[float]:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return None
+    try:
+        return round(float(x), digits)
+    except (ValueError, TypeError):
+        return None
+
+
+def fmt_price(x: Any) -> str:
+    v = safe_round(x, 2)
+    return f"${v:,.2f}" if v is not None else "N/A"
+
+
+def signal_color(signal: str) -> str:
+    return {"BUY": "green", "HOLD": "blue", "SELL": "red", "NO TRADE": "orange"}.get(signal, "gray")
+
+
+def timeframe_bias(df: pd.DataFrame) -> int:
+    if df.empty or len(df) < 50:
+        return 0
     row = df.iloc[-1]
+    score = 0
+    score += 1 if row["Close"] > row["EMA_21"] else -1
+    score += 1 if row["EMA_21"] > row["EMA_50"] else -1
+    if row["RSI"] > 52:
+        score += 1
+    elif row["RSI"] < 45:
+        score -= 1
+    score += 1 if row["MACD_HIST"] > 0 else -1
+    return score
+
+
+def detect_market_regime(daily_df: pd.DataFrame, vix_value: float) -> str:
+    if daily_df.empty or len(daily_df) < 200:
+        return "Insufficient Data"
+    row = daily_df.iloc[-1]
+    bullish = (row["Close"] > row["EMA_50"] and row["EMA_50"] > row["EMA_200"] and row["RSI"] > 52)
+    bearish = (row["Close"] < row["EMA_50"] and row["EMA_50"] < row["EMA_200"] and row["RSI"] < 48)
+    if bullish and vix_value < 18:
+        return "Bull Trend"
+    if bullish and vix_value >= 18:
+        return "Bull Trend / High Vol"
+    if bearish and vix_value >= 20:
+        return "Bear Trend"
+    if bearish and vix_value < 20:
+        return "Bear Trend / Low Vol"
+    return "Range / Transition"
+
+
+def current_signal(
+    entry_df: pd.DataFrame,
+    hourly_df: pd.DataFrame,
+    daily_df: pd.DataFrame,
+    vix_value: float,
+) -> Dict[str, Any]:
+    """Score the current bar and return a full signal dict."""
+    if entry_df.empty or len(entry_df) < 50:
+        return {
+            "signal": "NO TRADE", "score": 0, "confidence": 0,
+            "risk": "Unknown", "stop": None, "target": None,
+            "regime": "Insufficient Data", "reasons": ["Not enough data."],
+        }
+
+    row = entry_df.iloc[-1]
     score = 0
     reasons = []
 
-    if row["Close"] > row["EMA_8"]:
-        score += 1
-        reasons.append("Price above EMA 8.")
+    # --- Trend ---
+    if row["Close"] > row["EMA_21"]:
+        score += 1; reasons.append("Price is above EMA21.")
     else:
-        score -= 1
-        reasons.append("Price below EMA 8.")
-
-    if row["EMA_8"] > row["EMA_21"]:
-        score += 1
-        reasons.append("EMA 8 above EMA 21.")
-    else:
-        score -= 1
-        reasons.append("EMA 8 below EMA 21.")
+        score -= 1; reasons.append("Price is below EMA21.")
 
     if row["EMA_21"] > row["EMA_50"]:
-        score += 1
-        reasons.append("EMA 21 above EMA 50.")
+        score += 1; reasons.append("EMA21 is above EMA50.")
     else:
-        score -= 1
-        reasons.append("EMA 21 below EMA 50.")
+        score -= 1; reasons.append("EMA21 is below EMA50.")
 
-    if pd.notna(row["RSI"]):
-        if row["RSI"] > 55:
-            score += 1
-            reasons.append("RSI supportive.")
-        elif row["RSI"] < 45:
+    if not pd.isna(row["EMA_200"]):
+        if row["EMA_50"] > row["EMA_200"]:
+            score += 1; reasons.append("EMA50 is above EMA200.")
+        else:
+            score -= 1; reasons.append("EMA50 is below EMA200.")
+
+    # --- Momentum ---
+    if 52 <= row["RSI"] <= 68:
+        score += 1; reasons.append("RSI is in a healthy bullish zone.")
+    elif row["RSI"] < 45:
+        score -= 1; reasons.append("RSI is weak.")
+    elif row["RSI"] > 72:
+        score -= 1; reasons.append("RSI is stretched / overheated.")
+
+    if row["MACD_HIST"] > 0:
+        score += 1; reasons.append("MACD histogram is positive.")
+    else:
+        score -= 1; reasons.append("MACD histogram is negative.")
+
+    # --- Volume ---
+    if "Volume" in entry_df.columns and not pd.isna(row["VOL_AVG_20"]):
+        if row["Volume"] > row["VOL_AVG_20"]:
+            score += 1; reasons.append("Volume is above the 20-bar average.")
+        else:
+            reasons.append("Volume is not strongly confirming.")
+
+    # --- VIX ---
+    if vix_value < 18:
+        score += 1; reasons.append("VIX is supportive (< 18).")
+    elif vix_value > 24:
+        score -= 2; reasons.append(f"VIX is elevated ({vix_value:.1f}) — raises risk.")
+    else:
+        reasons.append(f"VIX is neutral ({vix_value:.1f}).")
+
+    # --- Higher timeframe alignment ---
+    htf = timeframe_bias(hourly_df)
+    dtf = timeframe_bias(daily_df)
+
+    if htf >= 2:
+        score += 1; reasons.append("Hourly trend confirms.")
+    elif htf <= -2:
+        score -= 1; reasons.append("Hourly trend disagrees.")
+
+    if dtf >= 2:
+        score += 2; reasons.append("Daily trend confirms.")
+    elif dtf <= -2:
+        score -= 2; reasons.append("Daily trend disagrees.")
+
+    # --- Extension filter ---
+    extended = False
+    if not pd.isna(row["ATR"]) and row["ATR"] > 0:
+        dist = abs(row["Close"] - row["EMA_21"]) / row["ATR"]
+        if dist > 1.8:
+            extended = True
             score -= 1
-            reasons.append("RSI weak.")
+            reasons.append("Price is extended versus ATR and EMA21.")
 
-    if score >= 3:
-        return "BULLISH", score, reasons
-    if score <= -3:
-        return "BEARISH", score, reasons
-    return "NEUTRAL", score, reasons
+    regime = detect_market_regime(daily_df, vix_value)
 
-
-
-
-def state_series(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if out.empty:
-        out["state"] = []
-        return out
-
-    states = []
-    mode = "FLAT"
-
-    for _, row in out.iterrows():
-        score = 0
-        score += 1 if row["Close"] > row["EMA_8"] else -1
-        score += 1 if row["EMA_8"] > row["EMA_21"] else -1
-        score += 1 if row["EMA_21"] > row["EMA_50"] else -1
-
-        if pd.notna(row["RSI"]):
-            if row["RSI"] > 55:
-                score += 1
-            elif row["RSI"] < 45:
-                score -= 1
-
-        bullish = score >= 3
-        bearish = score <= -3
-        weakening_long = (row["Close"] < row["EMA_8"]) or (pd.notna(row["RSI"]) and row["RSI"] < 48)
-        weakening_short = (row["Close"] > row["EMA_8"]) or (pd.notna(row["RSI"]) and row["RSI"] > 52)
-
-        state = "NO TRADE"
-
-        if mode == "FLAT":
-            if bullish:
-                state = "BUY"
-                mode = "LONG"
-            elif bearish:
-                state = "SELL"
-                mode = "SHORT"
-        elif mode == "LONG":
-            if bearish or weakening_long:
-                state = "EXIT BUY"
-                mode = "FLAT"
-            else:
-                state = "HOLD BUY"
-        elif mode == "SHORT":
-            if bullish or weakening_short:
-                state = "EXIT SELL"
-                mode = "FLAT"
-            else:
-                state = "HOLD SELL"
-
-        states.append(state)
-
-    out["state"] = states
-    out["prev_state"] = out["state"].shift(1)
-    return out
-
-
-def find_chart_signals(df: pd.DataFrame):
-    marked = state_series(df)
-    buy_rows, sell_rows, exit_buy_rows, exit_sell_rows = [], [], [], []
-
-    for _, row in marked.iterrows():
-        base = {
-            "index": row["Time"],
-            "Low": row["Low"],
-            "High": row["High"],
-            "ATR": 0 if pd.isna(row.get("ATR")) else row.get("ATR", 0),
-            "Close": row["Close"],
-        }
-        state = row["state"]
-        prev_state = row["prev_state"]
-
-        if state == "BUY" and prev_state != "BUY":
-            buy_rows.append({**base, "label": f"BUY<br>{float(row['Close']):.2f}"})
-        elif state == "SELL" and prev_state != "SELL":
-            sell_rows.append({**base, "label": f"SELL<br>{float(row['Close']):.2f}"})
-        elif state == "EXIT BUY" and prev_state != "EXIT BUY":
-            exit_buy_rows.append({**base, "label": f"EXIT<br>{float(row['Close']):.2f}"})
-        elif state == "EXIT SELL" and prev_state != "EXIT SELL":
-            exit_sell_rows.append({**base, "label": f"EXIT<br>{float(row['Close']):.2f}"})
-
-    return (
-        pd.DataFrame(buy_rows),
-        pd.DataFrame(sell_rows),
-        pd.DataFrame(exit_buy_rows),
-        pd.DataFrame(exit_sell_rows),
-    )
-
-
-def make_underlying_chart(df: pd.DataFrame, symbol: str):
-    chart_df = df.copy()
-    if chart_df.empty:
-        return go.Figure()
-
-    chart_df["Time"] = pd.to_datetime(chart_df["Time"], errors="coerce")
-    chart_df = chart_df.dropna(subset=["Time"]).sort_values("Time").tail(140).copy()
-
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=chart_df["Time"],
-        open=chart_df["Open"],
-        high=chart_df["High"],
-        low=chart_df["Low"],
-        close=chart_df["Close"],
-        name=symbol
-    ))
-
-    for col in ["EMA_8", "EMA_21", "EMA_50"]:
-        if col in chart_df.columns:
-            fig.add_trace(go.Scatter(
-                x=chart_df["Time"],
-                y=chart_df[col],
-                mode="lines",
-                name=col
-            ))
-
-    buy_points, sell_points, exit_buy_points, exit_sell_points = find_chart_signals(chart_df)
-
-    if not buy_points.empty:
-        for _, row in buy_points.tail(8).iterrows():
-            fig.add_annotation(
-                x=row["index"],
-                y=row["Low"] - max(float(row["ATR"]) * 0.2, 0.05),
-                text=row["label"],
-                showarrow=True,
-                arrowhead=2,
-                arrowcolor="green",
-                font=dict(color="green", size=10),
-                ax=0,
-                ay=35,
-            )
-
-    if not sell_points.empty:
-        for _, row in sell_points.tail(8).iterrows():
-            fig.add_annotation(
-                x=row["index"],
-                y=row["High"] + max(float(row["ATR"]) * 0.2, 0.05),
-                text=row["label"],
-                showarrow=True,
-                arrowhead=2,
-                arrowcolor="red",
-                font=dict(color="red", size=10),
-                ax=0,
-                ay=-35,
-            )
-
-    if not exit_buy_points.empty:
-        for _, row in exit_buy_points.tail(8).iterrows():
-            fig.add_annotation(
-                x=row["index"],
-                y=row["High"] + max(float(row["ATR"]) * 0.15, 0.05),
-                text=row["label"],
-                showarrow=True,
-                arrowhead=2,
-                arrowcolor="orange",
-                font=dict(color="orange", size=10),
-                ax=0,
-                ay=-30,
-            )
-
-    if not exit_sell_points.empty:
-        for _, row in exit_sell_points.tail(8).iterrows():
-            fig.add_annotation(
-                x=row["index"],
-                y=row["Low"] - max(float(row["ATR"]) * 0.15, 0.05),
-                text=row["label"],
-                showarrow=True,
-                arrowhead=2,
-                arrowcolor="orange",
-                font=dict(color="orange", size=10),
-                ax=0,
-                ay=30,
-            )
-
-    x_start = chart_df["Time"].iloc[0]
-    x_end = chart_df["Time"].iloc[-1]
-
-    fig.update_layout(
-        height=560,
-        xaxis_rangeslider_visible=False,
-        dragmode="pan",
-        hovermode="x unified",
-        xaxis=dict(type="date", range=[x_start, x_end]),
-    )
-    return fig
-
-
-def contract_quality(
-    underlying_price: Optional[float],
-    strike: Optional[float],
-    bid: Optional[float],
-    ask: Optional[float],
-    volume: Optional[float],
-    open_interest: Optional[float],
-    iv: Optional[float],
-    delta: Optional[float],
-) -> dict:
-    score = 100
-    reasons = []
-    spread = None
-    spread_pct = None
-
-    if bid is not None and ask is not None:
-        spread = float(ask) - float(bid)
-        if ask and ask > 0:
-            spread_pct = spread / float(ask)
-
-    if spread_pct is None:
-        score -= 25
-        reasons.append("No usable bid/ask spread.")
-    elif spread_pct > 0.20:
-        score -= 30
-        reasons.append("Spread too wide.")
-    elif spread_pct > 0.10:
-        score -= 15
-        reasons.append("Spread somewhat wide.")
+    if score >= 6 and "Bear" not in regime and not extended:
+        signal = "BUY"
+    elif score <= -4:
+        signal = "SELL"
+    elif 2 <= score <= 5:
+        signal = "HOLD"
     else:
-        reasons.append("Spread acceptable.")
+        signal = "NO TRADE"
 
-    if ask is None:
-        score -= 15
-        reasons.append("No ask price.")
-    elif ask < 0.10:
-        score -= 20
-        reasons.append("Premium too tiny / noisy.")
-    elif ask > 10:
-        score -= 10
-        reasons.append("Premium is expensive.")
-    else:
-        reasons.append("Premium in a workable range.")
+    atr   = row["ATR"] if not pd.isna(row["ATR"]) else None
+    close = row["Close"]
+    stop  = target = None
+    risk  = "Medium"
 
-    if underlying_price is not None and strike is not None and underlying_price > 0:
-        moneyness = abs(float(strike) - float(underlying_price)) / float(underlying_price)
-        if moneyness > 0.05:
-            score -= 20
-            reasons.append("Strike far from underlying.")
-        elif moneyness > 0.02:
-            score -= 8
-            reasons.append("Strike slightly far from underlying.")
-        else:
-            reasons.append("Strike near the underlying.")
+    if atr and atr > 0:
+        if signal == "BUY":
+            stop   = close - 1.2 * atr
+            target = close + 2.0 * atr
+        elif signal == "SELL":
+            stop   = close + 1.2 * atr
+            target = close - 2.0 * atr
 
-    if volume is not None:
-        if float(volume) < 10:
-            score -= 15
-            reasons.append("Low contract volume.")
-        else:
-            reasons.append("Volume acceptable.")
+    if vix_value > 24:
+        risk = "High"
+    elif vix_value < 18 and "Bull" in regime:
+        risk = "Low"
 
-    if open_interest is not None:
-        if float(open_interest) < 50:
-            score -= 15
-            reasons.append("Low open interest.")
-        else:
-            reasons.append("Open interest acceptable.")
+    confidence = min(95, max(5, 50 + score * 6))
 
-    if iv is not None and float(iv) > 2.0:
-        score -= 10
-        reasons.append("Implied volatility very high.")
-
-    if delta is None:
-        reasons.append("Greeks unavailable.")
-    else:
-        reasons.append("Delta available.")
-
-    score = max(0, min(100, score))
     return {
-        "score": score,
-        "quality_ok": score >= 55,
-        "spread": spread,
-        "spread_pct": spread_pct,
-        "reasons": reasons,
+        "signal": signal, "score": int(score), "confidence": int(confidence),
+        "risk": risk, "stop": stop, "target": target,
+        "regime": regime, "reasons": reasons,
     }
 
 
-def derive_options_state(stock_bias: str, option_side: str, has_position: bool, quality_ok: bool) -> str:
-    side = option_side.upper()
+# ---------------------------------------------------------------------------
+# VECTORISED SIGNAL SCORING  (for backtest + chart arrows)
+# ---------------------------------------------------------------------------
+def vector_signal_score(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["score"] = 0
 
-    if not quality_ok:
-        return "NO TRADE"
+    out["score"] += np.where(out["Close"] > out["EMA_21"], 1, -1)
+    out["score"] += np.where(out["EMA_21"] > out["EMA_50"], 1, -1)
+    out["score"] += np.where(out["EMA_50"] > out["EMA_200"], 1, -1)
 
-    if side == "CALL":
-        if stock_bias == "BULLISH" and not has_position:
-            return "ENTER CALL"
-        if stock_bias == "BULLISH" and has_position:
-            return "HOLD CALL"
-        if stock_bias != "BULLISH" and has_position:
-            return "WEAKENING"
-        return "NO TRADE"
+    out["score"] += np.where((out["RSI"] >= 52) & (out["RSI"] <= 68), 1, 0)
+    out["score"] += np.where(out["RSI"] < 45, -1, 0)
+    out["score"] += np.where(out["RSI"] > 72, -1, 0)
 
-    if side == "PUT":
-        if stock_bias == "BEARISH" and not has_position:
-            return "ENTER PUT"
-        if stock_bias == "BEARISH" and has_position:
-            return "HOLD PUT"
-        if stock_bias != "BEARISH" and has_position:
-            return "WEAKENING"
-        return "NO TRADE"
+    out["score"] += np.where(out["MACD_HIST"] > 0, 1, -1)
 
-    return "NO TRADE"
+    if "Volume" in out.columns and "VOL_AVG_20" in out.columns:
+        out["score"] += np.where(out["Volume"] > out["VOL_AVG_20"], 1, 0)
 
+    if "VIX_CLOSE" in out.columns:
+        out["score"] += np.where(out["VIX_CLOSE"] < 18, 1, 0)
+        out["score"] += np.where(out["VIX_CLOSE"] > 24, -2, 0)
 
-def manage_active_trade(active_trade: Optional[dict], current_premium: Optional[float], stock_bias: str) -> dict:
-    if not active_trade:
-        return {"state": None, "notes": []}
+    atr_dist = abs(out["Close"] - out["EMA_21"]) / out["ATR"].replace(0, np.nan)
+    out["extended"] = atr_dist > 1.8
+    out["score"] += np.where(out["extended"], -1, 0)
 
-    notes = []
-    side = active_trade["option_side"].upper()
-    state = f"HOLD {side}"
-
-    stop_hit = False
-    tp1_hit = False
-    tp2_hit = False
-    weakening = False
-
-    if current_premium is not None:
-        if current_premium <= active_trade["premium_stop"]:
-            stop_hit = True
-            notes.append("Premium stop hit.")
-        elif current_premium >= active_trade["tp2"]:
-            tp2_hit = True
-            notes.append("TP2 hit.")
-        elif current_premium >= active_trade["tp1"]:
-            tp1_hit = True
-            notes.append("TP1 hit.")
-
-    if side == "CALL" and stock_bias != "BULLISH":
-        weakening = True
-        notes.append("Underlying bias weakened for calls.")
-    if side == "PUT" and stock_bias != "BEARISH":
-        weakening = True
-        notes.append("Underlying bias weakened for puts.")
-
-    if stop_hit or tp2_hit:
-        state = f"EXIT {side}"
-    elif tp1_hit:
-        state = "TP1 HIT"
-    elif weakening:
-        state = "WEAKENING"
-
-    return {"state": state, "notes": notes}
-
-
-# ----------------------------
-# START
-# ----------------------------
-if not ALPACA_KEY or not ALPACA_SECRET:
-    st.error("Add ALPACA_API_KEY and ALPACA_SECRET_KEY to Streamlit secrets first.")
-    st.stop()
-
-with st.sidebar:
-    st.header("Setup")
-    symbol = st.text_input("Underlying", value=DEFAULT_SYMBOL).upper().strip()
-    option_side = st.selectbox("Direction", ["Call", "Put"])
-    tf = st.selectbox("Underlying timeframe", ["1Min", "5Min", "15Min", "1Hour"], index=1)
-    qty = st.number_input("Contracts", min_value=1, max_value=100, value=10, step=1)
-    order_style = st.selectbox("Order type", ["market", "limit"])
-
-pre_snapshot = get_stock_snapshot(symbol)
-pre_underlying_price = safe_get(pre_snapshot, "latestTrade", "p")
-
-contracts_raw = get_option_contracts(symbol, None, option_side)
-expirations = sorted({c.get("expiration_date") for c in contracts_raw if c.get("expiration_date")})
-
-colA, colB, colC = st.columns(3)
-with colA:
-    expiration = st.selectbox("Expiration", expirations, index=0 if expirations else None)
-with colB:
-    contracts_for_exp = [c for c in contracts_raw if c.get("expiration_date") == expiration] if expiration else []
-    strikes = sorted({float(c.get("strike_price")) for c in contracts_for_exp if c.get("strike_price") is not None})
-    default_strike_index = 0
-    if strikes and pre_underlying_price is not None:
-        default_strike_index = min(range(len(strikes)), key=lambda i: abs(strikes[i] - float(pre_underlying_price)))
-    strike = st.selectbox("Strike", strikes, index=default_strike_index if strikes else None)
-with colC:
-    if st.button("Refresh data", use_container_width=True, key="top_refresh_btn"):
-        st.cache_data.clear()
-        st.rerun()
-
-selected_contract = None
-if expiration and strike is not None:
-    for c in contracts_for_exp:
-        if float(c.get("strike_price")) == float(strike):
-            selected_contract = c
-            break
-
-contract_symbol = selected_contract.get("symbol") if selected_contract else None
-
-underlying_snapshot = get_stock_snapshot(symbol)
-bars = add_underlying_indicators(get_stock_bars(symbol, tf, 120))
-stock_bias, stock_score, stock_reasons = stock_signal(bars)
-
-last_trade = safe_get(underlying_snapshot, "latestTrade", "p")
-daily_close = safe_get(underlying_snapshot, "dailyBar", "c")
-prev_close = safe_get(underlying_snapshot, "prevDailyBar", "c")
-
-snapshot = get_option_snapshot(contract_symbol) if contract_symbol else {}
-quote_bid = safe_get(snapshot, "latestQuote", "bp")
-quote_ask = safe_get(snapshot, "latestQuote", "ap")
-quote_mid = None
-if quote_bid is not None and quote_ask is not None:
-    quote_mid = (float(quote_bid) + float(quote_ask)) / 2.0
-last_option_trade = safe_get(snapshot, "latestTrade", "p")
-current_premium = quote_mid if quote_mid is not None else last_option_trade
-
-delta = safe_get(snapshot, "greeks", "delta")
-gamma = safe_get(snapshot, "greeks", "gamma")
-theta = safe_get(snapshot, "greeks", "theta")
-vega = safe_get(snapshot, "greeks", "vega")
-iv = safe_get(snapshot, "implied_volatility")
-day_bar = safe_get(snapshot, "dailyBar", default={}) or {}
-option_volume = day_bar.get("v")
-open_interest = selected_contract.get("open_interest") if selected_contract else None
-
-quality = contract_quality(
-    underlying_price=last_trade,
-    strike=strike,
-    bid=quote_bid,
-    ask=quote_ask,
-    volume=option_volume,
-    open_interest=open_interest,
-    iv=iv,
-    delta=delta,
-)
-
-broker_position = find_position(contract_symbol) if contract_symbol else None
-has_position = broker_position is not None or active_trade_matches(contract_symbol)
-
-base_state = derive_options_state(stock_bias, option_side, has_position, quality["quality_ok"])
-managed = manage_active_trade(
-    st.session_state.active_trade if active_trade_matches(contract_symbol) else None,
-    current_premium,
-    stock_bias,
-)
-state = managed["state"] or base_state
-
-# ----------------------------
-# PANELS
-# ----------------------------
-st.subheader("Underlying")
-u1, u2, u3, u4 = st.columns(4)
-u1.metric("Bias", stock_bias)
-u2.metric("Score", stock_score)
-u3.metric("Latest Trade", fmt_money(last_trade))
-u4.metric("Daily / Prev", f"{fmt_money(daily_close)} / {fmt_money(prev_close)}")
-
-with st.expander("Why the underlying bias"):
-    for r in stock_reasons:
-        st.write(f"- {r}")
-
-st.subheader("Option Contract")
-o1, o2, o3, o4, o5, o6 = st.columns(6)
-o1.metric("Contract", contract_symbol or "N/A")
-o2.metric("Bid", fmt_money(quote_bid))
-o3.metric("Ask", fmt_money(quote_ask))
-o4.metric("Mid", fmt_money(quote_mid))
-o5.metric("Last", fmt_money(last_option_trade))
-o6.metric("Spread", fmt_money(quality["spread"]))
-
-if any(x is not None for x in [delta, gamma, theta, vega, iv]):
-    g1, g2, g3, g4, g5 = st.columns(5)
-    g1.metric("Delta", fmt_num(delta, 3))
-    g2.metric("Gamma", fmt_num(gamma, 4))
-    g3.metric("Theta", fmt_num(theta, 4))
-    g4.metric("Vega", fmt_num(vega, 4))
-    g5.metric("IV", fmt_num(iv, 3))
-
-st.subheader("Contract Quality")
-q1, q2, q3, q4 = st.columns(4)
-q1.metric("Quality Score", quality["score"])
-q2.metric("Quality Verdict", "PASS" if quality["quality_ok"] else "FAIL")
-q3.metric("Volume", fmt_num(option_volume, 0))
-q4.metric("Open Interest", fmt_num(open_interest, 0))
-
-with st.expander("Why this contract passed / failed"):
-    for r in quality["reasons"]:
-        st.write(f"- {r}")
-
-st.subheader("Trade State")
-s1, s2, s3 = st.columns(3)
-s1.metric("State", state)
-s2.metric("Holding this contract?", "Yes" if has_position else "No")
-s3.metric("Direction", option_side)
-
-# ----------------------------
-# TRADE PLAN + MEMORY
-# ----------------------------
-active_trade = st.session_state.get("active_trade")
-is_same_locked_trade = bool(
-    active_trade
-    and contract_symbol
-    and active_trade.get("contract_symbol") == contract_symbol
-)
-
-if is_same_locked_trade:
-    locked_entry = float(active_trade["entry_premium"])
-    locked_stop = float(active_trade["premium_stop"])
-    locked_tp1 = float(active_trade["tp1"])
-    locked_tp2 = float(active_trade["tp2"])
-else:
-    locked_entry = None
-    locked_stop = None
-    locked_tp1 = None
-    locked_tp2 = None
-
-default_entry = locked_entry if locked_entry is not None else (
-    quote_ask if quote_ask is not None else (last_option_trade if last_option_trade is not None else 0.0)
-)
-
-if not is_same_locked_trade:
-    st.session_state["entry_premium_input"] = float(default_entry or 0.0)
-
-st.subheader("Trade Plan")
-p1, p2, p3, p4, p5 = st.columns(5)
-
-with p1:
-    entry_premium = st.number_input(
-        "Entry premium",
-        min_value=0.0,
-        value=float(default_entry or 0.0),
-        step=0.05,
-        key="entry_premium_input",
-        disabled=is_same_locked_trade
+    out["signal_label"] = np.select(
+        [out["score"] >= 6, out["score"] <= -4, (out["score"] >= 2) & (out["score"] <= 5)],
+        ["BUY", "SELL", "HOLD"],
+        default="NO TRADE",
     )
+    return out
 
-with p2:
-    stop_pct = st.slider(
-        "Stop %",
-        5, 50, 20, 1,
-        key="stop_pct_input",
-        disabled=is_same_locked_trade
-    )
 
-with p3:
-    tp1_pct = st.slider(
-        "TP1 %",
-        10, 100, 30, 1,
-        key="tp1_pct_input",
-        disabled=is_same_locked_trade
-    )
+def find_chart_signals(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    marked = vector_signal_score(df.copy())
+    marked["prev_signal"] = marked["signal_label"].shift(1)
+    marked["fresh_buy"]  = (marked["signal_label"] == "BUY")  & (marked["prev_signal"] != "BUY")
+    marked["fresh_sell"] = (marked["signal_label"] == "SELL") & (marked["prev_signal"] != "SELL")
 
-with p4:
-    tp2_pct = st.slider(
-        "TP2 %",
-        20, 200, 50, 1,
-        key="tp2_pct_input",
-        disabled=is_same_locked_trade
-    )
+    buy_rows, sell_rows = [], []
+    open_trade = None
 
-with p5:
-    min_rr = st.slider(
-        "Min R/R",
-        1.0, 3.0, 2.0, 0.1,
-        key="min_rr_input",
-        disabled=is_same_locked_trade
-    )
+    for idx, row in marked.iterrows():
+        if row["fresh_buy"]:
+            buy_rows.append({
+                "index": idx, "Low": row["Low"], "High": row["High"],
+                "ATR": row["ATR"], "Close": row["Close"],
+                "label": f"BUY<br>{float(row['Close']):.2f}",
+            })
+            open_trade = {"price": float(row["Close"])}
 
-if is_same_locked_trade:
-    premium_stop = locked_stop
-    tp1 = locked_tp1
-    tp2 = locked_tp2
-    rr1 = ((tp1 - locked_entry) / max(0.0001, locked_entry - premium_stop)) if locked_entry > premium_stop else None
-    rr2 = ((tp2 - locked_entry) / max(0.0001, locked_entry - premium_stop)) if locked_entry > premium_stop else None
-else:
-    premium_stop = None
-    tp1 = None
-    tp2 = None
-    rr1 = None
-    rr2 = None
+        elif row["fresh_sell"]:
+            label = f"SELL<br>{float(row['Close']):.2f}"
+            if open_trade is not None:
+                pnl = ((float(row["Close"]) / open_trade["price"]) - 1.0) * 100.0
+                label = f"SELL<br>{float(row['Close']):.2f}<br>{pnl:+.2f}%"
+                open_trade = None
+            sell_rows.append({
+                "index": idx, "Low": row["Low"], "High": row["High"],
+                "ATR": row["ATR"], "Close": row["Close"], "label": label,
+            })
 
-    if entry_premium > 0:
-        risk_amt = entry_premium * (stop_pct / 100.0)
-        premium_stop = max(0.01, entry_premium - risk_amt)
-        tp1 = entry_premium * (1 + tp1_pct / 100.0)
-        tp2 = entry_premium * (1 + tp2_pct / 100.0)
-        rr1 = (tp1 - entry_premium) / max(0.0001, entry_premium - premium_stop)
-        rr2 = (tp2 - entry_premium) / max(0.0001, entry_premium - premium_stop)
+    return pd.DataFrame(buy_rows), pd.DataFrame(sell_rows)
 
-r1, r2, r3, r4, r5 = st.columns(5)
-r1.metric("Premium Stop", fmt_money(premium_stop))
-r2.metric("TP1", fmt_money(tp1))
-r3.metric("TP2", fmt_money(tp2))
-r4.metric("R/R to TP1", "N/A" if rr1 is None else f"{rr1:.2f}")
-r5.metric("R/R to TP2", "N/A" if rr2 is None else f"{rr2:.2f}")
 
-if is_same_locked_trade:
-    st.success("Locked trade active. Trade Plan is frozen until cleared or closed.")
+# ---------------------------------------------------------------------------
+# BACKTEST
+# ---------------------------------------------------------------------------
+def run_backtest(df: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
+    bt = vector_signal_score(df.copy())
+    bt = bt.dropna(subset=["EMA_21", "EMA_50", "EMA_200", "RSI", "MACD_HIST", "ATR"]).copy()
 
-if base_state in ["ENTER CALL", "ENTER PUT"] and rr1 is not None and rr1 < min_rr:
-    st.warning("Direction is good, but reward/risk is below your minimum. No trade.")
-elif state == "NO TRADE":
-    st.info("No trade right now.")
-elif state in ["HOLD CALL", "HOLD PUT"]:
-    st.info(f"{state}. Manage the open position.")
-elif state == "TP1 HIT":
-    st.success("TP1 HIT. Consider taking partial profit and tightening your stop.")
-elif state in ["EXIT CALL", "EXIT PUT"]:
-    st.warning(f"{state}. Hard exit condition triggered.")
-elif state == "WEAKENING":
-    st.warning("WEAKENING. Soft warning only. Momentum or bias has weakened.")
-else:
-    st.success(state)
+    if bt.empty or len(bt) < 50:
+        return None, None
 
-if managed["notes"]:
-    with st.expander("Trade manager notes"):
-        for n in managed["notes"]:
-            st.write(f"- {n}")
+    position, in_pos = [], 0
+    for _, row in bt.iterrows():
+        enter = row["score"] >= 6 and not row["extended"]
+        hold  = row["score"] >= 2 and row["Close"] > row["EMA_50"]
+        exit_ = row["score"] <= 1 or row["Close"] < row["EMA_21"]
 
-# ----------------------------
-# LIVE P&L
-# ----------------------------
-st.subheader("Live P&L")
-pos = broker_position if broker_position else None
-if is_same_locked_trade and current_premium is not None:
-    custom_pl = (float(current_premium) - float(st.session_state.active_trade["entry_premium"])) * int(st.session_state.active_trade["qty"]) * 100
-    custom_pl_pct = ((float(current_premium) / float(st.session_state.active_trade["entry_premium"])) - 1.0) * 100
-else:
-    custom_pl = None
-    custom_pl_pct = None
+        if in_pos == 0 and enter:
+            in_pos = 1
+        elif in_pos == 1 and exit_ and not hold:
+            in_pos = 0
+        position.append(in_pos)
 
-l1, l2, l3, l4, l5, l6 = st.columns(6)
-l1.metric("Position?", "Yes" if has_position else "No")
-l2.metric("Qty", str(st.session_state.active_trade["qty"]) if is_same_locked_trade else (pos.get("qty") if pos else "0"))
-l3.metric("Locked Entry", fmt_money(st.session_state.active_trade["entry_premium"]) if is_same_locked_trade else fmt_money(pos.get("avg_entry_price") if pos else None))
-l4.metric("Current Premium", fmt_money(current_premium))
-l5.metric("Custom P/L", fmt_money(custom_pl))
-l6.metric("Custom P/L %", fmt_num(custom_pl_pct, 2))
+    bt["position"]      = position
+    bt["ret"]           = bt["Close"].pct_change().fillna(0)
+    bt["strategy_ret"]  = bt["ret"] * bt["position"].shift(1).fillna(0)
+    bt["equity_curve"]  = (1 + bt["strategy_ret"]).cumprod()
+    bt["buy_hold_curve"]= (1 + bt["ret"]).cumprod()
+    bt["equity_peak"]   = bt["equity_curve"].cummax()
+    bt["drawdown"]      = bt["equity_curve"] / bt["equity_peak"] - 1
 
-# ----------------------------
-# ACTIONS
-# ----------------------------
-st.subheader("Actions")
-limit_seed = quote_ask if quote_ask is not None else entry_premium
-limit_price = st.number_input("Limit price (used only for limit orders)", min_value=0.0, value=float(limit_seed or 0.0), step=0.05, key="limit_price_input")
+    bt["pos_change"] = bt["position"].diff().fillna(0)
+    entries = bt.index[bt["pos_change"] == 1].tolist()
+    exits   = bt.index[bt["pos_change"] == -1].tolist()
+    if len(exits) < len(entries):
+        exits.append(bt.index[-1])
 
-a1, a2, a3 = st.columns(3)
+    trades = []
+    for en, ex in zip(entries, exits):
+        ep = bt.loc[en, "Close"]
+        xp = bt.loc[ex, "Close"]
+        trades.append({
+            "Entry Time":  en,
+            "Exit Time":   ex,
+            "Entry Price": round(float(ep), 2),
+            "Exit Price":  round(float(xp), 2),
+            "Return %":    round(((xp / ep) - 1) * 100, 2),
+        })
 
-can_start = (
-    contract_symbol is not None
-    and entry_premium > 0
-    and premium_stop is not None
-    and tp1 is not None
-    and tp2 is not None
-)
+    trades_df = pd.DataFrame(trades)
+    total_trades = len(trades_df)
+    win_rate  = (trades_df["Return %"] > 0).mean() * 100 if total_trades else 0.0
+    avg_trade = trades_df["Return %"].mean()             if total_trades else 0.0
 
-if a1.button("Start / Lock Trade", use_container_width=True, disabled=not can_start, key="lock_trade_btn"):
-    save_active_trade({
-        "contract_symbol": contract_symbol,
-        "option_side": option_side.upper(),
-        "qty": int(qty),
-        "entry_premium": float(entry_premium),
-        "premium_stop": float(premium_stop),
-        "tp1": float(tp1),
-        "tp2": float(tp2),
-    })
-    st.success("Trade locked. Entry, stop, and targets will now stay fixed.")
+    stats = {
+        "Strategy Return %": round((bt["equity_curve"].iloc[-1] - 1) * 100, 2),
+        "Buy & Hold %":      round((bt["buy_hold_curve"].iloc[-1] - 1) * 100, 2),
+        "Max Drawdown %":    round(bt["drawdown"].min() * 100, 2),
+        "Trades":            int(total_trades),
+        "Win Rate %":        round(win_rate, 2),
+        "Avg Trade %":       round(avg_trade, 2),
+    }
+    return bt, {"stats": stats, "trades": trades_df}
 
-if a2.button("Paper Buy to Open", use_container_width=True, disabled=contract_symbol is None, key="buy_open_btn"):
+
+# ---------------------------------------------------------------------------
+# WEBHOOK
+# ---------------------------------------------------------------------------
+def send_webhook_alert(webhook_url: str, payload: dict) -> Tuple[bool, str]:
+    if not webhook_url:
+        return False, "Missing webhook URL"
     try:
-        order = place_option_order(contract_symbol, int(qty), "buy", order_style, limit_price if order_style == "limit" else None)
-        st.success(f"Submitted buy order: {order.get('id', 'ok')}")
+        data = json.dumps(payload).encode("utf-8")
+        req  = urllib.request.Request(
+            webhook_url, data=data,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return True, f"HTTP {getattr(resp, 'status', 200)}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTPError {e.code}"
+    except urllib.error.URLError as e:
+        return False, f"URLError {e.reason}"
     except Exception as e:
-        st.error(f"Buy order failed: {e}")
+        return False, str(e)
 
-if a3.button("Paper Sell to Close", use_container_width=True, disabled=contract_symbol is None, key="sell_close_btn"):
-    try:
-        order = place_option_order(contract_symbol, int(qty), "sell", order_style, limit_price if order_style == "limit" else None)
-        st.success(f"Submitted sell order: {order.get('id', 'ok')}")
-        if active_trade_matches(contract_symbol):
-            clear_active_trade()
-    except Exception as e:
-        st.error(f"Sell order failed: {e}")
 
-c1, c2 = st.columns(2)
-if c1.button("Clear Locked Trade", use_container_width=True, key="clear_trade_btn"):
-    clear_active_trade()
-    st.info("Locked trade cleared.")
-if c2.button("Refresh data", use_container_width=True, key="bottom_refresh_btn"):
-    st.cache_data.clear()
-    st.rerun()
+# ---------------------------------------------------------------------------
+# CHARTS
+# ---------------------------------------------------------------------------
+def make_candlestick_chart(df: pd.DataFrame, symbol: str):
+    chart_df = df.tail(180).copy()
 
-# ----------------------------
-# NEWS
-# ----------------------------
-st.subheader("News")
-news = get_news(symbol, limit=8)
-if not news:
-    st.write("No recent news returned.")
-else:
-    for item in news[:6]:
-        headline = item.get("headline", "No headline")
-        source = item.get("source", "")
-        ts = item.get("updated_at", item.get("created_at", ""))
-        summary = item.get("summary", "")
-        st.markdown(f"**{headline}**")
-        st.caption(f"{source} • {ts}")
-        if summary:
-            st.write(summary[:220] + ("..." if len(summary) > 220 else ""))
-        st.markdown("---")
+    # Green/red volume bars matching candle direction
+    vol_colors = [
+        "rgba(0,180,90,0.30)" if c >= o else "rgba(220,50,50,0.30)"
+        for c, o in zip(chart_df["Close"], chart_df["Open"])
+    ]
 
-# ----------------------------
-# CHART
-# ----------------------------
-st.subheader("Underlying Chart")
-if not bars.empty:
-    st.plotly_chart(
-        make_underlying_chart(bars, symbol),
-        use_container_width=True,
-        config={"scrollZoom": True, "displaylogo": False}
+    fig = make_subplots(
+        rows=3, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        row_heights=[0.60, 0.20, 0.20],
+        specs=[[{"secondary_y": True}], [{}], [{}]],
     )
-else:
-    st.info("No underlying chart data returned.")
 
-with st.expander("More contract details"):
-    st.json({"contract": selected_contract or {}, "snapshot": snapshot or {}})
+    # Candlesticks
+    fig.add_trace(go.Candlestick(
+        x=chart_df.index,
+        open=chart_df["Open"], high=chart_df["High"],
+        low=chart_df["Low"],   close=chart_df["Close"],
+        name="Candles",
+    ), row=1, col=1, secondary_y=False)
 
-st.caption("This version keeps strike selection near the underlying price and refreshes the planning entry premium until you lock the trade.")
+    # EMAs
+    ema_colors = {"EMA_8": "#f59e0b", "EMA_21": "#3b82f6", "EMA_50": "#a855f7", "EMA_200": "#ef4444"}
+    for col, color in ema_colors.items():
+        if col in chart_df.columns and chart_df[col].notna().sum() > 0:
+            fig.add_trace(go.Scatter(
+                x=chart_df.index, y=chart_df[col],
+                mode="lines", name=col,
+                line=dict(color=color, width=1.2),
+            ), row=1, col=1, secondary_y=False)
+
+    # Volume — right axis
+    fig.add_trace(go.Bar(
+        x=chart_df.index, y=chart_df["Volume"],
+        name="Volume", marker_color=vol_colors,
+    ), row=1, col=1, secondary_y=True)
+
+    # RSI
+    fig.add_trace(go.Scatter(
+        x=chart_df.index, y=chart_df["RSI"],
+        mode="lines", name="RSI",
+        line=dict(color="#06b6d4", width=1.5),
+    ), row=2, col=1)
+    for level in [70, 30]:
+        fig.add_hline(y=level, row=2, col=1, line_dash="dot",
+                      line_color="rgba(150,150,150,0.5)")
+
+    # MACD
+    fig.add_trace(go.Scatter(
+        x=chart_df.index, y=chart_df["MACD"],
+        mode="lines", name="MACD",
+        line=dict(color="#3b82f6", width=1.5),
+    ), row=3, col=1)
+    fig.add_trace(go.Scatter(
+        x=chart_df.index, y=chart_df["MACD_SIGNAL"],
+        mode="lines", name="Signal",
+        line=dict(color="#f59e0b", width=1.2),
+    ), row=3, col=1)
+    hist_colors = [
+        "rgba(0,180,90,0.55)" if v >= 0 else "rgba(220,50,50,0.55)"
+        for v in chart_df["MACD_HIST"].fillna(0)
+    ]
+    fig.add_trace(go.Bar(
+        x=chart_df.index, y=chart_df["MACD_HIST"],
+        name="Histogram", marker_color=hist_colors,
+    ), row=3, col=1)
+
+    # Buy / Sell arrows
+    buy_pts, sell_pts = find_chart_signals(chart_df)
+    if not buy_pts.empty:
+        buy_pts = buy_pts.tail(20)
+    if not sell_pts.empty:
+        sell_pts = sell_pts.tail(20)
+
+    for _, r in buy_pts.iterrows():
+        y_val = r["Low"] - (r["ATR"] * 0.25 if pd.notna(r["ATR"]) else r["Low"] * 0.003)
+        fig.add_annotation(
+            x=r["index"], y=y_val, xref="x", yref="y",
+            text=r["label"], showarrow=True,
+            arrowhead=2, arrowsize=1.2, arrowwidth=2, arrowcolor="#00b45a",
+            ax=0, ay=40, font=dict(color="#00b45a", size=9), align="center",
+        )
+
+    for _, r in sell_pts.iterrows():
+        y_val = r["High"] + (r["ATR"] * 0.25 if pd.notna(r["ATR"]) else r["High"] * 0.003)
+        fig.add_annotation(
+            x=r["index"], y=y_val, xref="x", yref="y",
+            text=r["label"], showarrow=True,
+            arrowhead=2, arrowsize=1.2, arrowwidth=2, arrowcolor="#e03030",
+            ax=0, ay=-44, font=dict(color="#e03030", size=9), align="center",
+        )
+
+    fig.update_layout(
+        title=f"{symbol} — Price · RSI · MACD",
+        xaxis_rangeslider_visible=False,
+        height=900,
+        legend_orientation="h",
+        dragmode="pan",
+        hovermode="x unified",
+        margin=dict(l=60, r=80, t=50, b=40),
+        xaxis=dict(fixedrange=False, showspikes=True, spikemode="across",
+                   spikesnap="cursor", spikedash="dot"),
+        xaxis2=dict(fixedrange=False, showspikes=True, spikemode="across", spikesnap="cursor"),
+        xaxis3=dict(fixedrange=False, showspikes=True, spikemode="across", spikesnap="cursor"),
+    )
+
+    # Price — LEFT axis (y fixed so scroll only zooms x)
+    fig.update_yaxes(title_text="Price", side="left",  fixedrange=True,
+                     row=1, col=1, secondary_y=False)
+    # Volume — RIGHT axis, capped at 25 % of pane height
+    fig.update_yaxes(title_text="Volume", side="right", fixedrange=True,
+                     showgrid=False,
+                     range=[0, chart_df["Volume"].max() * 4],
+                     row=1, col=1, secondary_y=True)
+    fig.update_yaxes(title_text="RSI",  fixedrange=True, row=2, col=1)
+    fig.update_yaxes(title_text="MACD", fixedrange=True, row=3, col=1)
+
+    return fig
+
+
+def make_backtest_chart(bt_df: pd.DataFrame):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=bt_df.index, y=bt_df["equity_curve"],
+                             mode="lines", name="Strategy",
+                             line=dict(color="#3b82f6", width=2)))
+    fig.add_trace(go.Scatter(x=bt_df.index, y=bt_df["buy_hold_curve"],
+                             mode="lines", name="Buy & Hold",
+                             line=dict(color="#9ca3af", width=1.5, dash="dot")))
+    fig.update_layout(title="Backtest Equity Curve", height=450,
+                      hovermode="x unified", dragmode="pan")
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# AI ANALYSIS
+# ---------------------------------------------------------------------------
+def build_ai_prompt(symbol, timeframe, curr_price, sig, last, vix_value):
+    return f"""You are a disciplined institutional market strategist.
+
+Analyze this setup in 6 concise bullet points:
+1. Market regime summary
+2. What favors bulls right now
+3. What favors bears right now
+4. Recommended action: BUY / HOLD / SELL / NO TRADE — and why
+5. Key level that would invalidate the current thesis
+6. One tactical note for the next session
+
+Market data:
+Ticker: {symbol}
+Timeframe: {timeframe}
+Price: {curr_price}
+Signal: {sig['signal']}  |  Confidence: {sig['confidence']}%  |  Score: {sig['score']}
+Risk: {sig['risk']}  |  Regime: {sig['regime']}
+RSI: {safe_round(last['RSI'], 2)}  |  ATR: {safe_round(last['ATR'], 2)}
+EMA8: {safe_round(last['EMA_8'], 2)}  EMA21: {safe_round(last['EMA_21'], 2)}
+EMA50: {safe_round(last['EMA_50'], 2)}  EMA200: {safe_round(last['EMA_200'], 2)}
+MACD: {safe_round(last['MACD'], 3)}  Signal: {safe_round(last['MACD_SIGNAL'], 3)}  Hist: {safe_round(last['MACD_HIST'], 3)}
+VIX: {vix_value}
+Stop: {safe_round(sig['stop'], 2)}  Target: {safe_round(sig['target'], 2)}
+"""
+
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+def main():
+    st.title("📈 SPY Buddy Pro Elite")
+    st.caption("Real-time signal dashboard powered by Alpaca Markets. Not financial advice.")
+
+    # ---- Sidebar ----
+    with st.sidebar:
+        st.header("Controls")
+
+        # Alpaca credentials input (if not in secrets)
+        api_key, secret_key = get_alpaca_keys()
+        if not api_key or not secret_key:
+            st.warning("Alpaca keys not found in secrets. Enter them below:")
+            api_key    = st.text_input("Alpaca API Key",    type="password", key="ak")
+            secret_key = st.text_input("Alpaca Secret Key", type="password", key="sk")
+
+        symbol    = st.text_input("Ticker", value=DEFAULT_SYMBOL).upper().strip()
+        timeframe = st.selectbox("Chart Timeframe", list(TF_MAP.keys()), index=0)
+
+        st.divider()
+        st.subheader("Backtest")
+        backtest_bars = st.slider("Bars to backtest", 120, 2000, 500, 20)
+
+        st.divider()
+        st.subheader("Alerts")
+        enable_webhook = st.checkbox("Enable webhook alerts", value=False)
+        webhook_url    = st.text_input(
+            "Webhook URL", value="", type="password",
+            help="Discord, Slack-compatible, or any automation webhook.",
+        )
+
+        st.divider()
+        show_ai = st.checkbox("Enable AI analysis", value=True)
+
+        if st.button("🔄 Refresh Data", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+    # ---- Data fetch ----
+    with st.spinner("Fetching market data from Alpaca…"):
+        entry_raw  = fetch_alpaca_bars(symbol,  timeframe, api_key or "", secret_key or "")
+        hourly_raw = fetch_alpaca_bars(symbol,  "1 Hour",  api_key or "", secret_key or "")
+        daily_raw  = fetch_alpaca_bars(symbol,  "1 Day",   api_key or "", secret_key or "")
+        vix_raw    = fetch_vix(api_key or "", secret_key or "")
+
+    if entry_raw.empty:
+        st.error(f"No data returned for **{symbol}**. Check the ticker or your Alpaca credentials.")
+        st.stop()
+
+    if vix_raw.empty:
+        st.warning("VIX data unavailable — using default value of 20.")
+        vix_raw = pd.DataFrame({"Close": [20.0]}, index=[pd.Timestamp.now()])
+
+    entry_df  = add_indicators(entry_raw)
+    hourly_df = add_indicators(hourly_raw)
+    daily_df  = add_indicators(daily_raw)
+    entry_df  = attach_daily_vix(entry_df, vix_raw)
+
+    if len(entry_df) < 30:
+        st.error("Not enough bars to compute indicators on this timeframe.")
+        st.stop()
+
+    last  = entry_df.iloc[-1]
+    prev  = entry_df.iloc[-2] if len(entry_df) > 1 else last
+
+    # Try to get a fresher quote from Alpaca
+    live_price = fetch_latest_quote(symbol, api_key or "", secret_key or "")
+    curr_price = safe_round(live_price or last["Close"], 2)
+    prev_price = safe_round(prev["Close"], 2)
+    change     = round(curr_price - prev_price, 2) if curr_price and prev_price else None
+    vix_value  = safe_round(vix_raw["Close"].iloc[-1], 2) or 20.0
+
+    sig = current_signal(entry_df, hourly_df, daily_df, vix_value)
+
+    # ---- Alert logic ----
+    alert_key   = f"last_signal_{symbol}_{timeframe}"
+    history_key = f"alert_history_{symbol}_{timeframe}"
+    if history_key not in st.session_state:
+        st.session_state[history_key] = []
+
+    prev_signal = st.session_state.get(alert_key)
+    if prev_signal is None:
+        st.session_state[alert_key] = sig["signal"]
+    elif prev_signal != sig["signal"]:
+        event_time = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+        alert_row  = {
+            "Time": event_time, "Old": prev_signal, "New": sig["signal"],
+            "Price": curr_price, "Ticker": symbol, "Timeframe": timeframe,
+            "Confidence": sig["confidence"], "Risk": sig["risk"],
+        }
+        st.session_state[history_key].insert(0, alert_row)
+        st.session_state[alert_key] = sig["signal"]
+
+        toast_icon = {"BUY": "🟢", "HOLD": "🔵", "SELL": "🔴", "NO TRADE": "🟠"}.get(sig["signal"], "📈")
+        st.warning(f"Signal changed: {prev_signal} → {sig['signal']} at {fmt_price(curr_price)}")
+        st.toast(f"{symbol} {timeframe}: {prev_signal} → {sig['signal']} at {fmt_price(curr_price)}", icon=toast_icon)
+
+        if enable_webhook and webhook_url:
+            payload = {"text": (
+                f"{symbol} {timeframe} signal: {prev_signal} → {sig['signal']} | "
+                f"Price: {curr_price} | Confidence: {sig['confidence']}% | "
+                f"Risk: {sig['risk']} | Regime: {sig['regime']}"
+            )}
+            ok, msg = send_webhook_alert(webhook_url, payload)
+            st.toast("Webhook sent ✅" if ok else f"Webhook failed: {msg}", icon="✅" if ok else "❌")
+
+    # ---- Header metrics ----
+    st.subheader(f"Signal: :{signal_color(sig['signal'])}[{sig['signal']}]")
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Price",      fmt_price(curr_price), f"{change:+.2f}" if change else None)
+    c2.metric("Confidence", f"{sig['confidence']}%")
+    c3.metric("Score",      f"{sig['score']}")
+    c4.metric("VIX",        f"{vix_value}")
+    c5.metric("Risk",       sig["risk"])
+    c6.metric("Regime",     sig["regime"])
+
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("RSI",    f"{safe_round(last['RSI'], 2)}")
+    d2.metric("ATR",    fmt_price(safe_round(last["ATR"], 2)))
+    d3.metric("Stop",   fmt_price(safe_round(sig["stop"], 2)))
+    d4.metric("Target", fmt_price(safe_round(sig["target"], 2)))
+
+    # ---- Tabs ----
+    tab1, tab2, tab3, tab4 = st.tabs(["Dashboard", "Backtest", "Alerts", "Raw Data"])
+
+    # ======================== TAB 1 — DASHBOARD ========================
+    with tab1:
+        with st.expander("How the engine decides"):
+            st.markdown("""
+**BUY** — Score ≥ 6, regime not bearish, price not over-extended.
+**HOLD** — Score 2–5: trend is okay but not strong enough for a fresh entry.
+**SELL** — Score ≤ −4: trend and momentum have broken down.
+**NO TRADE** — Mixed signals, stretched price, or hostile volatility.
+            """)
+
+        st.subheader(f"{symbol} Chart")
+        if PLOTLY_AVAILABLE:
+            fig = make_candlestick_chart(entry_df, symbol)
+            st.plotly_chart(fig, use_container_width=True, config={
+                "scrollZoom": True, "displaylogo": False,
+                "modeBarButtonsToRemove": ["select2d", "lasso2d"],
+            })
+            st.caption("Scroll to zoom the time axis · Click-drag to pan · Double-click to reset.")
+        else:
+            st.warning("Plotly not installed — showing simplified chart.")
+            cols = ["Close", "EMA_8", "EMA_21", "EMA_50"]
+            if entry_df["EMA_200"].notna().sum() > 0:
+                cols.append("EMA_200")
+            st.line_chart(entry_df[cols].tail(150))
+
+        left, right = st.columns([1.2, 1])
+
+        with left:
+            st.subheader("Why this signal")
+            for reason in sig["reasons"]:
+                st.write(f"- {reason}")
+
+        with right:
+            st.subheader("Latest Snapshot")
+            snap = pd.DataFrame({
+                "Metric": ["Close", "EMA_8", "EMA_21", "EMA_50", "EMA_200",
+                            "RSI", "MACD", "MACD_SIG", "MACD_HIST", "ATR", "VIX", "Volume"],
+                "Value": [
+                    safe_round(last["Close"], 2), safe_round(last["EMA_8"], 2),
+                    safe_round(last["EMA_21"], 2), safe_round(last["EMA_50"], 2),
+                    safe_round(last["EMA_200"], 2), safe_round(last["RSI"], 2),
+                    safe_round(last["MACD"], 3), safe_round(last["MACD_SIGNAL"], 3),
+                    safe_round(last["MACD_HIST"], 3), safe_round(last["ATR"], 2),
+                    safe_round(last.get("VIX_CLOSE"), 2),
+                    int(last["Volume"]) if not pd.isna(last["Volume"]) else None,
+                ],
+            })
+            st.dataframe(snap, use_container_width=True, hide_index=True)
+
+        # ---- AI Panel ----
+        if show_ai:
+            st.subheader("🤖 AI Technical Verdict")
+            gemini_key = get_gemini_key()
+
+            if gemini_key and GENAI_AVAILABLE:
+                if st.button("▶ Run Deep Analysis"):
+                    prompt = build_ai_prompt(symbol, timeframe, curr_price, sig, last, vix_value)
+                    with st.spinner("Running AI analysis…"):
+                        try:
+                            client   = genai.Client(api_key=gemini_key)
+                            response = client.models.generate_content(
+                                model="gemini-2.5-flash", contents=prompt,
+                            )
+                            st.info(response.text)
+                        except Exception as e:
+                            st.error(f"AI analysis failed: {e}")
+            else:
+                st.caption(
+                    "To enable AI analysis, add `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) "
+                    "to your Streamlit secrets and install `google-genai`."
+                )
+
+    # ======================== TAB 2 — BACKTEST ========================
+    with tab2:
+        st.subheader("Simple Backtest")
+        bt_df, bt_result = run_backtest(entry_df.tail(backtest_bars).copy())
+
+        if bt_df is None:
+            st.info("Not enough data for backtest on this timeframe / bar count.")
+        else:
+            s = bt_result["stats"]
+            b1, b2, b3, b4, b5, b6 = st.columns(6)
+            b1.metric("Strategy Return", f"{s['Strategy Return %']}%")
+            b2.metric("Buy & Hold",      f"{s['Buy & Hold %']}%")
+            b3.metric("Max Drawdown",    f"{s['Max Drawdown %']}%")
+            b4.metric("Trades",          f"{s['Trades']}")
+            b5.metric("Win Rate",        f"{s['Win Rate %']}%")
+            b6.metric("Avg Trade",       f"{s['Avg Trade %']}%")
+
+            if PLOTLY_AVAILABLE:
+                st.plotly_chart(make_backtest_chart(bt_df), use_container_width=True,
+                                config={"scrollZoom": True, "displaylogo": False})
+            else:
+                st.line_chart(bt_df[["equity_curve", "buy_hold_curve"]])
+
+            with st.expander("Trade log"):
+                trades_df = bt_result["trades"]
+                if trades_df.empty:
+                    st.write("No completed trades in this window.")
+                else:
+                    st.dataframe(trades_df, use_container_width=True)
+
+            st.caption("Simplified backtest — a quick sanity check, not execution-grade research.")
+
+    # ======================== TAB 3 — ALERTS ========================
+    with tab3:
+        st.subheader("Signal Change Alerts")
+        st.caption("Logged whenever the signal changes on refresh.")
+        alerts = st.session_state[history_key]
+        if alerts:
+            st.dataframe(pd.DataFrame(alerts), use_container_width=True)
+        else:
+            st.write("No signal changes logged yet.")
+
+    # ======================== TAB 4 — RAW DATA ========================
+    with tab4:
+        st.subheader("Raw Data (last 100 bars)")
+        st.dataframe(entry_df.tail(100), use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        st.error(f"Unexpected error: {e}")
