@@ -298,11 +298,12 @@ def add_indicators(df:pd.DataFrame)->pd.DataFrame:
     if "Time" in out.columns:
         out["_date"]=pd.to_datetime(out["Time"]).dt.date
         out["_tp"]=(out["High"]+out["Low"]+out["Close"])/3
-        out["_cumvol"]=out.groupby("_date")["Volume"].cumsum()
-        out["_cumtpvol"]=out.groupby("_date").apply(
-            lambda g:(g["_tp"]*g["Volume"]).cumsum()).reset_index(level=0,drop=True)
-        out["VWAP"]=out["_cumtpvol"]/out["_cumvol"].replace(0,pd.NA)
-        out.drop(columns=["_date","_tp","_cumvol","_cumtpvol"],inplace=True,errors="ignore")
+        out["_tpvol"]=out["_tp"]*out["Volume"]
+        # Use transform instead of apply to avoid pandas 2.x/3.x shape mismatch
+        out["_cumvol"] =out.groupby("_date")["Volume"].transform("cumsum")
+        out["_cumtpvol"]=out.groupby("_date")["_tpvol"].transform("cumsum")
+        out["VWAP"]=out["_cumtpvol"]/out["_cumvol"].replace(0,np.nan)
+        out.drop(columns=["_date","_tp","_tpvol","_cumvol","_cumtpvol"],inplace=True,errors="ignore")
 
     # ── Bollinger Bands ───────────────────────────────────────────────────
     bb_mid=out["Close"].rolling(20).mean()
