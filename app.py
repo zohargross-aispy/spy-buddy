@@ -5,9 +5,6 @@ import urllib.error
 from typing import Tuple
 
 import streamlit as st
-refresh_ms = 30000 if timeframe != "1 Day" else 60000
-if AUTOREFRESH_AVAILABLE:
-    st_autorefresh(interval=refresh_ms, key=f"autorefresh_{timeframe}")
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -947,6 +944,10 @@ with st.sidebar:
     if st.button("🔄 Refresh Data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
+
+if AUTOREFRESH_AVAILABLE:
+    refresh_ms = 60000 if timeframe == "1 Day" else 30000
+    st_autorefresh(interval=refresh_ms, key=f"autorefresh_{timeframe}")
 
 refresh_ms = 30000 if timeframe != "1 Day" else 60000
 if AUTOREFRESH_AVAILABLE:
