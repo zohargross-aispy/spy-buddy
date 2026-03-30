@@ -909,13 +909,18 @@ with st.sidebar:
     st.subheader("Risk / Sizing")
     account_size=st.number_input("Account size ($)",min_value=1000,max_value=10_000_000,value=25000,step=1000)
     max_risk_pct=st.slider("Max risk per trade (%)",0.5,5.0,2.0,0.5)
-    st.divider()
-    st.subheader("Smart Picker DTE")
-    min_dte=st.slider("Min DTE",7,30,21,1)
-    max_dte=st.slider("Max DTE",21,90,45,1)
+    max_risk_dollar=account_size*(max_risk_pct/100.0)
+    st.markdown(
+        f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;'
+        f'padding:10px 14px;margin:6px 0">'
+        f'<div style="color:#8b949e;font-size:.75rem;text-transform:uppercase;letter-spacing:.06em">Max Loss This Trade</div>'
+        f'<div style="color:#f87171;font-size:1.5rem;font-weight:900">${max_risk_dollar:,.0f}</div>'
+        f'<div style="color:#6b7280;font-size:.72rem">{max_risk_pct}% of ${account_size:,}</div>'
+        f'</div>',unsafe_allow_html=True)
     st.divider()
     enable_multi_tf=st.checkbox("Multi-timeframe confirmation",value=True)
     show_auto_pick =st.checkbox("Show smart contract picker",value=True)
+    min_dte=21; max_dte=45  # fixed defaults, no sliders needed
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATA FETCH
@@ -1125,7 +1130,7 @@ if show_auto_pick:
                     ap_c3.metric("Expected Move High",fmt_money(em_hi))
             except: pass
     else:
-        st.info("No contract found matching delta 0.35–0.60 and your DTE range. Try widening the DTE sliders.")
+        st.info("No contract found matching delta 0.35–0.60 within the 21–45 DTE window. Try a different expiration or direction.")
     st.divider()
 
 # ── Kelly Sizing ───────────────────────────────────────────────────────────────
@@ -1140,12 +1145,16 @@ with k3:
 
 premium_for_kelly=float(quote_ask) if quote_ask else (float(last_option_trade) if last_option_trade else 1.0)
 kelly=kelly_contracts(hist_win_rate,hist_avg_win,hist_avg_loss,account_size,premium_for_kelly,max_risk_pct)
-kc1,kc2,kc3,kc4,kc5=st.columns(5)
+# Override max_loss to always reflect account_size * max_risk_pct
+kelly_max_loss=max_risk_dollar
+kelly_contracts_capped=max(1,int(kelly_max_loss/(premium_for_kelly*100))) if premium_for_kelly>0 else kelly["contracts"]
+kc1,kc2,kc3,kc4,kc5,kc6=st.columns(6)
 kc1.metric("Full Kelly %",  f"{kelly['full_kelly_pct']}%")
 kc2.metric("¼ Kelly %",     f"{kelly['quarter_kelly_pct']}%")
-kc3.metric("Contracts",     kelly["contracts"])
-kc4.metric("Total Cost",    fmt_money(kelly["total_cost"]))
-kc5.metric("Max Loss",      fmt_money(kelly["max_loss"]))
+kc3.metric("Contracts (Kelly)", kelly["contracts"])
+kc4.metric("Contracts (Risk Cap)", kelly_contracts_capped)
+kc5.metric("Total Cost",    fmt_money(kelly_contracts_capped*premium_for_kelly*100))
+kc6.metric("Max Loss",      f'${kelly_max_loss:,.0f}',delta=f"{max_risk_pct}% of ${account_size:,}",delta_color="off")
 st.caption(kelly["notes"])
 
 st.divider()
