@@ -371,7 +371,7 @@ def make_underlying_chart(df: pd.DataFrame, symbol: str, option_side: str):
                 name=col
             ))
 
-    buy_points, sell_points = find_chart_signals(chart_df, option_side)
+    buy_points, sell_points, exit_buy_points, exit_sell_points = find_chart_signals(chart_df, option_side)
 
     if not buy_points.empty:
         for _, row in buy_points.tail(20).iterrows():
