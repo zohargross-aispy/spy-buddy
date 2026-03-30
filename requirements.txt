@@ -1,6 +1,6 @@
 streamlit
-yfinance
 pandas
-numpy
 plotly
-google-genai
+requests
+websocket-client
+streamlit-autorefresh
