@@ -344,7 +344,6 @@ def current_signal(entry_df: pd.DataFrame, hourly_df: pd.DataFrame, daily_df: pd
     score = 0
     reasons = []
 
-    # Trend
     if row["Close"] > row["EMA_21"]:
         score += 1
         reasons.append("Price is above EMA21.")
@@ -367,7 +366,6 @@ def current_signal(entry_df: pd.DataFrame, hourly_df: pd.DataFrame, daily_df: pd
             score -= 1
             reasons.append("EMA50 is below EMA200.")
 
-    # Momentum
     if 52 <= row["RSI"] <= 68:
         score += 1
         reasons.append("RSI is in a healthy bullish zone.")
@@ -385,7 +383,6 @@ def current_signal(entry_df: pd.DataFrame, hourly_df: pd.DataFrame, daily_df: pd
         score -= 1
         reasons.append("MACD histogram is negative.")
 
-    # Volume
     if "Volume" in entry_df.columns and not pd.isna(row["VOL_AVG_20"]):
         if row["Volume"] > row["VOL_AVG_20"]:
             score += 1
@@ -393,7 +390,6 @@ def current_signal(entry_df: pd.DataFrame, hourly_df: pd.DataFrame, daily_df: pd
         else:
             reasons.append("Volume is not strongly confirming.")
 
-    # VWAP
     if pd.notna(row.get("VWAP", np.nan)):
         if row["Close"] > row["VWAP"]:
             score += 1
@@ -402,7 +398,6 @@ def current_signal(entry_df: pd.DataFrame, hourly_df: pd.DataFrame, daily_df: pd
             score -= 1
             reasons.append("Price is below VWAP.")
 
-    # Previous day structure
     if pd.notna(row.get("PREV_DAY_HIGH", np.nan)) and row["Close"] > row["PREV_DAY_HIGH"]:
         score += 1
         reasons.append("Price is above the previous day high.")
@@ -410,7 +405,6 @@ def current_signal(entry_df: pd.DataFrame, hourly_df: pd.DataFrame, daily_df: pd
         score -= 1
         reasons.append("Price is below the previous day low.")
 
-    # Opening range structure
     if pd.notna(row.get("OPENING_RANGE_HIGH", np.nan)) and row["Close"] > row["OPENING_RANGE_HIGH"]:
         score += 1
         reasons.append("Price is above the opening range high.")
@@ -418,7 +412,6 @@ def current_signal(entry_df: pd.DataFrame, hourly_df: pd.DataFrame, daily_df: pd
         score -= 1
         reasons.append("Price is below the opening range low.")
 
-    # VIX
     if vix_value < 18:
         score += 1
         reasons.append("VIX is supportive.")
@@ -428,7 +421,6 @@ def current_signal(entry_df: pd.DataFrame, hourly_df: pd.DataFrame, daily_df: pd
     else:
         reasons.append("VIX is neutral.")
 
-    # Higher timeframe alignment
     htf = timeframe_bias(hourly_df)
     dtf = timeframe_bias(daily_df)
 
@@ -446,7 +438,6 @@ def current_signal(entry_df: pd.DataFrame, hourly_df: pd.DataFrame, daily_df: pd
         score -= 2
         reasons.append("Daily trend disagrees.")
 
-    # Extension filter
     extended = False
     if not pd.isna(row["ATR"]) and row["ATR"] > 0:
         dist = abs(row["Close"] - row["EMA_21"]) / row["ATR"]
@@ -558,7 +549,6 @@ def current_signal(entry_df: pd.DataFrame, hourly_df: pd.DataFrame, daily_df: pd
     }
 
 
-
 def vector_signal_score(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["score"] = 0
@@ -635,10 +625,7 @@ def find_chart_signals(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
                 "Close": row["Close"],
                 "label": buy_label,
             })
-            open_trade = {
-                "index": idx,
-                "price": float(row["Close"]),
-            }
+            open_trade = {"index": idx, "price": float(row["Close"])}
 
         elif row["fresh_sell"]:
             sell_label = f"SELL<br>{float(row['Close']):.2f}"
@@ -657,10 +644,7 @@ def find_chart_signals(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
                 "label": sell_label,
             })
 
-    buy_points = pd.DataFrame(buy_rows)
-    sell_points = pd.DataFrame(sell_rows)
-
-    return buy_points, sell_points
+    return pd.DataFrame(buy_rows), pd.DataFrame(sell_rows)
 
 
 def run_backtest(df: pd.DataFrame, timeframe_label: str):
@@ -734,7 +718,6 @@ def run_backtest(df: pd.DataFrame, timeframe_label: str):
         profit_factor = np.nan
 
     exposure = bt["position"].mean() * 100
-
     bars_year = TF_MAP[timeframe_label]["bars_year"]
     sharpe = np.nan
     std = bt["strategy_ret"].std()
@@ -756,14 +739,7 @@ def run_backtest(df: pd.DataFrame, timeframe_label: str):
     return bt, {"stats": stats, "trades": trades_df}
 
 
-def build_options_plan(
-    signal: str,
-    premium_entry: float,
-    stop_pct: float,
-    tp1_pct: float,
-    tp2_pct: float,
-    min_rr: float,
-) -> dict:
+def build_options_plan(signal: str, premium_entry: float, stop_pct: float, tp1_pct: float, tp2_pct: float, min_rr: float) -> dict:
     if premium_entry <= 0:
         return {
             "enabled": False,
@@ -795,13 +771,9 @@ def build_options_plan(
 
     rr1 = (premium_tp1 - premium_entry) / max(0.0001, premium_entry - premium_stop)
     rr2 = (premium_tp2 - premium_entry) / max(0.0001, premium_entry - premium_stop)
-
     trade_ok = rr1 >= min_rr
 
-    if trade_ok:
-        status = "Options setup passes minimum reward/risk."
-    else:
-        status = "NO TRADE for options. Reward/risk is below your minimum."
+    status = "Options setup passes minimum reward/risk." if trade_ok else "NO TRADE for options. Reward/risk is below your minimum."
 
     return {
         "enabled": True,
@@ -828,7 +800,6 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str, timeframe_label: str):
         specs=[[{"secondary_y": True}], [{}], [{}]]
     )
 
-    # Candles -> RIGHT axis
     fig.add_trace(
         go.Candlestick(
             x=chart_df.index,
@@ -841,7 +812,6 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str, timeframe_label: str):
         row=1, col=1, secondary_y=True
     )
 
-    # EMAs + VWAP + levels -> RIGHT axis
     price_lines = [
         ("EMA_8", "rgba(99, 102, 241, 0.90)", "solid"),
         ("EMA_21", "rgba(245, 158, 11, 0.95)", "solid"),
@@ -867,7 +837,6 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str, timeframe_label: str):
                 row=1, col=1, secondary_y=True
             )
 
-    # Volume -> LEFT axis
     volume_colors = np.where(
         chart_df["Close"] >= chart_df["Open"],
         "rgba(34, 197, 94, 0.30)",
@@ -884,7 +853,6 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str, timeframe_label: str):
         row=1, col=1, secondary_y=False
     )
 
-    # RSI
     fig.add_trace(
         go.Scatter(
             x=chart_df.index,
@@ -898,7 +866,6 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str, timeframe_label: str):
     fig.add_hline(y=70, row=2, col=1, line_dash="dot", line_color="rgba(239, 68, 68, 0.55)")
     fig.add_hline(y=30, row=2, col=1, line_dash="dot", line_color="rgba(34, 197, 94, 0.55)")
 
-    # MACD
     fig.add_trace(
         go.Scatter(
             x=chart_df.index,
@@ -934,7 +901,6 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str, timeframe_label: str):
         row=3, col=1
     )
 
-    # Buy / Sell arrows
     buy_points, sell_points = find_chart_signals(chart_df)
 
     if not buy_points.empty:
@@ -945,43 +911,21 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str, timeframe_label: str):
     for _, row in buy_points.iterrows():
         x_val = row["index"]
         y_val = row["Low"] - (row["ATR"] * 0.25 if pd.notna(row["ATR"]) else row["Low"] * 0.003)
-
         fig.add_annotation(
-            x=x_val,
-            y=y_val,
-            xref="x",
-            yref="y2",
-            text=row["label"],
-            showarrow=True,
-            arrowhead=2,
-            arrowsize=1.2,
-            arrowwidth=2,
-            arrowcolor="green",
-            ax=0,
-            ay=38,
-            font=dict(color="green", size=10),
-            align="center"
+            x=x_val, y=y_val, xref="x", yref="y2", text=row["label"],
+            showarrow=True, arrowhead=2, arrowsize=1.2, arrowwidth=2,
+            arrowcolor="green", ax=0, ay=38,
+            font=dict(color="green", size=10), align="center"
         )
 
     for _, row in sell_points.iterrows():
         x_val = row["index"]
         y_val = row["High"] + (row["ATR"] * 0.25 if pd.notna(row["ATR"]) else row["High"] * 0.003)
-
         fig.add_annotation(
-            x=x_val,
-            y=y_val,
-            xref="x",
-            yref="y2",
-            text=row["label"],
-            showarrow=True,
-            arrowhead=2,
-            arrowsize=1.2,
-            arrowwidth=2,
-            arrowcolor="red",
-            ax=0,
-            ay=-42,
-            font=dict(color="red", size=10),
-            align="center"
+            x=x_val, y=y_val, xref="x", yref="y2", text=row["label"],
+            showarrow=True, arrowhead=2, arrowsize=1.2, arrowwidth=2,
+            arrowcolor="red", ax=0, ay=-42,
+            font=dict(color="red", size=10), align="center"
         )
 
     fig.update_layout(
@@ -993,7 +937,6 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str, timeframe_label: str):
         hovermode="x unified"
     )
 
-    # Swapped axes: volume left, price right
     fig.update_yaxes(title_text="Volume", row=1, col=1, secondary_y=False, showgrid=False)
     fig.update_yaxes(title_text="Price", row=1, col=1, secondary_y=True)
     fig.update_yaxes(title_text="RSI", row=2, col=1)
@@ -1004,29 +947,9 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str, timeframe_label: str):
 
 def make_backtest_chart(bt_df: pd.DataFrame):
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=bt_df.index,
-            y=bt_df["equity_curve"],
-            mode="lines",
-            name="Strategy",
-            line=dict(width=2)
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=bt_df.index,
-            y=bt_df["buy_hold_curve"],
-            mode="lines",
-            name="Buy & Hold",
-            line=dict(width=2, dash="dot")
-        )
-    )
-    fig.update_layout(
-        title="Backtest Equity Curve",
-        height=460,
-        dragmode="pan"
-    )
+    fig.add_trace(go.Scatter(x=bt_df.index, y=bt_df["equity_curve"], mode="lines", name="Strategy", line=dict(width=2)))
+    fig.add_trace(go.Scatter(x=bt_df.index, y=bt_df["buy_hold_curve"], mode="lines", name="Buy & Hold", line=dict(width=2, dash="dot")))
+    fig.update_layout(title="Backtest Equity Curve", height=460, dragmode="pan")
     return fig
 
 
@@ -1035,7 +958,6 @@ def get_history(symbol: str, period: str, interval: str) -> pd.DataFrame:
     df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
     if df is None or df.empty:
         return pd.DataFrame()
-
     df = df.copy()
     df = df[~df.index.duplicated(keep="last")]
     return df
@@ -1051,9 +973,6 @@ def get_all_data(symbol: str, timeframe_label: str):
     return entry, hourly, daily, vix
 
 
-# ----------------------------
-# SIDEBAR
-# ----------------------------
 with st.sidebar:
     st.header("Controls")
     symbol = st.text_input("Ticker", value=DEFAULT_SYMBOL).upper().strip()
@@ -1075,12 +994,7 @@ with st.sidebar:
     st.divider()
     st.subheader("Alerts")
     enable_webhook = st.checkbox("Enable webhook alerts", value=False)
-    webhook_url = st.text_input(
-        "Webhook URL",
-        value="",
-        type="password",
-        help="Paste a Discord, Slack-compatible, or automation webhook URL."
-    )
+    webhook_url = st.text_input("Webhook URL", value="", type="password", help="Paste a Discord, Slack-compatible, or automation webhook URL.")
 
     st.divider()
     show_ai = st.checkbox("Enable AI panel", value=True)
@@ -1090,9 +1004,6 @@ with st.sidebar:
         st.rerun()
 
 
-# ----------------------------
-# MAIN
-# ----------------------------
 try:
     entry_raw, hourly_raw, daily_raw, vix_raw = get_all_data(symbol, timeframe)
 
@@ -1151,7 +1062,6 @@ try:
     if options_mode and options_plan["enabled"] and options_plan["trade_ok"] is False:
         display_signal = "NO TRADE"
 
-    # Alerts
     alert_key = f"last_signal_{symbol}_{timeframe}"
     history_key = f"alert_history_{symbol}_{timeframe}"
 
@@ -1165,7 +1075,6 @@ try:
 
     elif prev_signal != display_signal:
         event_time = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-
         alert_row = {
             "Time": event_time,
             "Old Signal": prev_signal,
@@ -1179,20 +1088,10 @@ try:
 
         st.session_state[history_key].insert(0, alert_row)
         st.session_state[alert_key] = display_signal
-
         st.warning(f"Signal changed: {prev_signal} → {display_signal} at {fmt_price(curr_price)}")
 
-        toast_icon = {
-            "BUY": "🟢",
-            "HOLD": "🔵",
-            "SELL": "🔴",
-            "NO TRADE": "🟠"
-        }.get(display_signal, "📈")
-
-        st.toast(
-            f"{symbol} {timeframe}: {prev_signal} → {display_signal} at {fmt_price(curr_price)}",
-            icon=toast_icon
-        )
+        toast_icon = {"BUY": "🟢", "HOLD": "🔵", "SELL": "🔴", "NO TRADE": "🟠"}.get(display_signal, "📈")
+        st.toast(f"{symbol} {timeframe}: {prev_signal} → {display_signal} at {fmt_price(curr_price)}", icon=toast_icon)
 
         if enable_webhook and webhook_url:
             payload = {
@@ -1207,13 +1106,8 @@ try:
             }
 
             ok, msg = send_webhook_alert(webhook_url, payload)
+            st.toast("Webhook alert sent" if ok else f"Webhook failed: {msg}", icon="✅" if ok else "❌")
 
-            if ok:
-                st.toast("Webhook alert sent", icon="✅")
-            else:
-                st.toast(f"Webhook failed: {msg}", icon="❌")
-
-    # Header
     st.subheader(f"Signal: :{signal_color(display_signal)}[{display_signal}]")
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -1293,14 +1187,7 @@ try:
 
         if PLOTLY_AVAILABLE:
             fig = make_candlestick_chart(entry_df, symbol, timeframe)
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-                config={
-                    "scrollZoom": True,
-                    "displaylogo": False
-                }
-            )
+            st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displaylogo": False})
             st.caption("Mouse wheel zooms. Mouse drag pans left and right. Double-click resets.")
         else:
             st.warning("Plotly is not installed, so showing a simpler chart without arrows or structure overlays.")
@@ -1343,12 +1230,7 @@ try:
 
         if show_ai:
             st.subheader("🤖 AI Technical Verdict")
-
-            api_key = None
-            if "GEMINI_API_KEY" in st.secrets:
-                api_key = st.secrets["GEMINI_API_KEY"]
-            elif "GOOGLE_API_KEY" in st.secrets:
-                api_key = st.secrets["GOOGLE_API_KEY"]
+            api_key = st.secrets.get("GEMINI_API_KEY") or st.secrets.get("GOOGLE_API_KEY")
 
             if api_key and GENAI_AVAILABLE:
                 if st.button("Run Deep Analysis"):
@@ -1395,20 +1277,15 @@ Option premium stop: {safe_round(options_plan['premium_stop'], 2)}
 Option premium TP1: {safe_round(options_plan['premium_tp1'], 2)}
 Option premium TP2: {safe_round(options_plan['premium_tp2'], 2)}
 """
-
                     with st.spinner("Running AI analysis..."):
                         client = genai.Client(api_key=api_key)
-                        response = client.models.generate_content(
-                            model="gemini-2.5-flash",
-                            contents=prompt
-                        )
+                        response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
                         st.info(response.text)
             else:
                 st.caption("To enable AI, install `google-genai` and add `GEMINI_API_KEY` or `GOOGLE_API_KEY` to Streamlit secrets.")
 
     with tab2:
         st.subheader("Advanced Backtest")
-
         bt_source = entry_df.tail(backtest_bars).copy()
         bt_df, bt_result = run_backtest(bt_source, timeframe)
 
@@ -1431,14 +1308,7 @@ Option premium TP2: {safe_round(options_plan['premium_tp2'], 2)}
             c9.metric("Sharpe", "N/A" if s["Sharpe"] is None else f"{s['Sharpe']}")
 
             if PLOTLY_AVAILABLE:
-                st.plotly_chart(
-                    make_backtest_chart(bt_df),
-                    use_container_width=True,
-                    config={
-                        "scrollZoom": True,
-                        "displaylogo": False
-                    }
-                )
+                st.plotly_chart(make_backtest_chart(bt_df), use_container_width=True, config={"scrollZoom": True, "displaylogo": False})
             else:
                 st.line_chart(bt_df[["equity_curve", "buy_hold_curve"]])
 
@@ -1454,7 +1324,6 @@ Option premium TP2: {safe_round(options_plan['premium_tp2'], 2)}
     with tab3:
         st.subheader("Signal Alerts")
         st.caption("Alerts are logged when the signal changes on refresh / rerun.")
-
         alerts = st.session_state[history_key]
         if alerts:
             st.dataframe(pd.DataFrame(alerts), use_container_width=True)
