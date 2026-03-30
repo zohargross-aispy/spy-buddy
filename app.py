@@ -268,6 +268,7 @@ def stock_signal(df: pd.DataFrame) -> tuple[str, int, list]:
     return "NEUTRAL", score, reasons
 
 
+
 def state_series(df: pd.DataFrame, option_side: str) -> pd.DataFrame:
     out = df.copy()
     if out.empty:
@@ -275,32 +276,42 @@ def state_series(df: pd.DataFrame, option_side: str) -> pd.DataFrame:
         return out
 
     states = []
+    prev_state = "NO TRADE"
+
     for _, row in out.iterrows():
         score = 0
         score += 1 if row["Close"] > row["EMA_8"] else -1
         score += 1 if row["EMA_8"] > row["EMA_21"] else -1
         score += 1 if row["EMA_21"] > row["EMA_50"] else -1
+
         if pd.notna(row["RSI"]):
             if row["RSI"] > 55:
                 score += 1
             elif row["RSI"] < 45:
                 score -= 1
 
+        bullish = score >= 3
+        bearish = score <= -3
+        weakening_long = (row["Close"] < row["EMA_8"]) or (pd.notna(row["RSI"]) and row["RSI"] < 48)
+        weakening_short = (row["Close"] > row["EMA_8"]) or (pd.notna(row["RSI"]) and row["RSI"] > 52)
+
         if option_side.upper() == "CALL":
-            if score >= 3:
-                state = "BUY"
-            elif score <= -2:
-                state = "SELL"
+            if bullish:
+                state = "BUY" if prev_state not in ["BUY", "HOLD BUY"] else "HOLD BUY"
+            elif prev_state in ["BUY", "HOLD BUY"] and weakening_long:
+                state = "EXIT BUY"
             else:
-                state = "HOLD"
+                state = "NO TRADE"
         else:
-            if score <= -3:
-                state = "SELL"
-            elif score >= 2:
-                state = "BUY"
+            if bearish:
+                state = "SELL" if prev_state not in ["SELL", "HOLD SELL"] else "HOLD SELL"
+            elif prev_state in ["SELL", "HOLD SELL"] and weakening_short:
+                state = "EXIT SELL"
             else:
-                state = "HOLD"
+                state = "NO TRADE"
+
         states.append(state)
+        prev_state = state
 
     out["state"] = states
     out["prev_state"] = out["state"].shift(1)
@@ -309,30 +320,34 @@ def state_series(df: pd.DataFrame, option_side: str) -> pd.DataFrame:
 
 def find_chart_signals(df: pd.DataFrame, option_side: str):
     marked = state_series(df, option_side)
-    buy_rows, sell_rows = [], []
+    buy_rows, sell_rows, exit_buy_rows, exit_sell_rows = [], [], [], []
 
-    for idx, row in marked.iterrows():
-        fresh_buy = row["state"] == "BUY" and row["prev_state"] != "BUY"
-        fresh_sell = row["state"] == "SELL" and row["prev_state"] != "SELL"
+    for _, row in marked.iterrows():
+        base = {
+            "index": row["Time"],
+            "Low": row["Low"],
+            "High": row["High"],
+            "ATR": 0 if pd.isna(row.get("ATR")) else row.get("ATR", 0),
+            "Close": row["Close"],
+        }
+        state = row["state"]
+        prev_state = row["prev_state"]
 
-        if fresh_buy:
-            buy_rows.append({
-                "index": row["Time"],
-                "Low": row["Low"],
-                "ATR": 0 if pd.isna(row.get("ATR")) else row.get("ATR", 0),
-                "label": f"BUY<br>{float(row['Close']):.2f}",
-            })
+        if state == "BUY" and prev_state != "BUY":
+            buy_rows.append({**base, "label": f"BUY<br>{float(row['Close']):.2f}"})
+        elif state == "SELL" and prev_state != "SELL":
+            sell_rows.append({**base, "label": f"SELL<br>{float(row['Close']):.2f}"})
+        elif state == "EXIT BUY" and prev_state != "EXIT BUY":
+            exit_buy_rows.append({**base, "label": f"EXIT<br>{float(row['Close']):.2f}"})
+        elif state == "EXIT SELL" and prev_state != "EXIT SELL":
+            exit_sell_rows.append({**base, "label": f"EXIT<br>{float(row['Close']):.2f}"})
 
-        if fresh_sell:
-            sell_rows.append({
-                "index": row["Time"],
-                "High": row["High"],
-                "ATR": 0 if pd.isna(row.get("ATR")) else row.get("ATR", 0),
-                "label": f"SELL<br>{float(row['Close']):.2f}",
-            })
-
-    return pd.DataFrame(buy_rows), pd.DataFrame(sell_rows)
-
+    return (
+        pd.DataFrame(buy_rows),
+        pd.DataFrame(sell_rows),
+        pd.DataFrame(exit_buy_rows),
+        pd.DataFrame(exit_sell_rows),
+    )
 
 def make_underlying_chart(df: pd.DataFrame, symbol: str, option_side: str):
     chart_df = df.tail(140).copy()
