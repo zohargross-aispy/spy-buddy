@@ -439,6 +439,9 @@ with st.sidebar:
     qty = st.number_input("Contracts", min_value=1, max_value=100, value=10, step=1)
     order_style = st.selectbox("Order type", ["market", "limit"])
 
+pre_snapshot = get_stock_snapshot(symbol)
+pre_underlying_price = safe_get(pre_snapshot, "latestTrade", "p")
+
 contracts_raw = get_option_contracts(symbol, None, option_side)
 expirations = sorted({c.get("expiration_date") for c in contracts_raw if c.get("expiration_date")})
 
@@ -448,7 +451,10 @@ with colA:
 with colB:
     contracts_for_exp = [c for c in contracts_raw if c.get("expiration_date") == expiration] if expiration else []
     strikes = sorted({float(c.get("strike_price")) for c in contracts_for_exp if c.get("strike_price") is not None})
-    strike = st.selectbox("Strike", strikes, index=0 if strikes else None)
+    default_strike_index = 0
+    if strikes and pre_underlying_price is not None:
+        default_strike_index = min(range(len(strikes)), key=lambda i: abs(strikes[i] - float(pre_underlying_price)))
+    strike = st.selectbox("Strike", strikes, index=default_strike_index if strikes else None)
 with colC:
     if st.button("Refresh data", use_container_width=True, key="top_refresh_btn"):
         st.cache_data.clear()
@@ -582,6 +588,9 @@ else:
 default_entry = locked_entry if locked_entry is not None else (
     quote_ask if quote_ask is not None else (last_option_trade if last_option_trade is not None else 0.0)
 )
+
+if not is_same_locked_trade:
+    st.session_state["entry_premium_input"] = float(default_entry or 0.0)
 
 st.subheader("Trade Plan")
 p1, p2, p3, p4, p5 = st.columns(5)
@@ -792,10 +801,7 @@ if not bars.empty:
 else:
     st.info("No underlying chart data returned.")
 
-with st.expander("Contract details"):
-    st.json(selected_contract or {})
+with st.expander("More contract details"):
+    st.json({"contract": selected_contract or {}, "snapshot": snapshot or {}})
 
-with st.expander("Snapshot payload"):
-    st.json(snapshot or {})
-
-st.caption("This version adds: chart restored, locked entry memory, TP/SL tracking, soft warning vs hard exit, and live P&L.")
+st.caption("This version keeps strike selection near the underlying price and refreshes the planning entry premium until you lock the trade.")
