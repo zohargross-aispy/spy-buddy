@@ -268,6 +268,133 @@ def stock_signal(df: pd.DataFrame) -> tuple[str, int, list]:
     return "NEUTRAL", score, reasons
 
 
+def state_series(df: pd.DataFrame, option_side: str) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        out["state"] = []
+        return out
+
+    states = []
+    for _, row in out.iterrows():
+        score = 0
+        score += 1 if row["Close"] > row["EMA_8"] else -1
+        score += 1 if row["EMA_8"] > row["EMA_21"] else -1
+        score += 1 if row["EMA_21"] > row["EMA_50"] else -1
+        if pd.notna(row["RSI"]):
+            if row["RSI"] > 55:
+                score += 1
+            elif row["RSI"] < 45:
+                score -= 1
+
+        if option_side.upper() == "CALL":
+            if score >= 3:
+                state = "BUY"
+            elif score <= -2:
+                state = "SELL"
+            else:
+                state = "HOLD"
+        else:
+            if score <= -3:
+                state = "SELL"
+            elif score >= 2:
+                state = "BUY"
+            else:
+                state = "HOLD"
+        states.append(state)
+
+    out["state"] = states
+    out["prev_state"] = out["state"].shift(1)
+    return out
+
+
+def find_chart_signals(df: pd.DataFrame, option_side: str):
+    marked = state_series(df, option_side)
+    buy_rows, sell_rows = [], []
+
+    for idx, row in marked.iterrows():
+        fresh_buy = row["state"] == "BUY" and row["prev_state"] != "BUY"
+        fresh_sell = row["state"] == "SELL" and row["prev_state"] != "SELL"
+
+        if fresh_buy:
+            buy_rows.append({
+                "index": idx,
+                "Low": row["Low"],
+                "ATR": 0 if pd.isna(row.get("ATR")) else row.get("ATR", 0),
+                "label": f"BUY<br>{float(row['Close']):.2f}",
+            })
+
+        if fresh_sell:
+            sell_rows.append({
+                "index": idx,
+                "High": row["High"],
+                "ATR": 0 if pd.isna(row.get("ATR")) else row.get("ATR", 0),
+                "label": f"SELL<br>{float(row['Close']):.2f}",
+            })
+
+    return pd.DataFrame(buy_rows), pd.DataFrame(sell_rows)
+
+
+def make_underlying_chart(df: pd.DataFrame, symbol: str, option_side: str):
+    chart_df = df.tail(140).copy()
+    fig = go.Figure()
+
+    fig.add_trace(go.Candlestick(
+        x=chart_df["Time"],
+        open=chart_df["Open"],
+        high=chart_df["High"],
+        low=chart_df["Low"],
+        close=chart_df["Close"],
+        name=symbol
+    ))
+
+    for col in ["EMA_8", "EMA_21", "EMA_50"]:
+        if col in chart_df.columns:
+            fig.add_trace(go.Scatter(
+                x=chart_df["Time"],
+                y=chart_df[col],
+                mode="lines",
+                name=col
+            ))
+
+    buy_points, sell_points = find_chart_signals(chart_df, option_side)
+
+    if not buy_points.empty:
+        for _, row in buy_points.tail(20).iterrows():
+            fig.add_annotation(
+                x=row["index"],
+                y=row["Low"] - max(float(row["ATR"]) * 0.2, 0.05),
+                text=row["label"],
+                showarrow=True,
+                arrowhead=2,
+                arrowcolor="green",
+                font=dict(color="green", size=10),
+                ax=0,
+                ay=35,
+            )
+
+    if not sell_points.empty:
+        for _, row in sell_points.tail(20).iterrows():
+            fig.add_annotation(
+                x=row["index"],
+                y=row["High"] + max(float(row["ATR"]) * 0.2, 0.05),
+                text=row["label"],
+                showarrow=True,
+                arrowhead=2,
+                arrowcolor="red",
+                font=dict(color="red", size=10),
+                ax=0,
+                ay=-35,
+            )
+
+    fig.update_layout(
+        height=560,
+        xaxis_rangeslider_visible=False,
+        dragmode="pan",
+        hovermode="x unified",
+    )
+    return fig
+
+
 def contract_quality(
     underlying_price: Optional[float],
     strike: Optional[float],
@@ -786,19 +913,11 @@ else:
 # ----------------------------
 st.subheader("Underlying Chart")
 if not bars.empty:
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=bars["Time"],
-        open=bars["Open"],
-        high=bars["High"],
-        low=bars["Low"],
-        close=bars["Close"],
-        name=symbol
-    ))
-    for col in ["EMA_8", "EMA_21", "EMA_50"]:
-        fig.add_trace(go.Scatter(x=bars["Time"], y=bars[col], mode="lines", name=col))
-    fig.update_layout(height=550, xaxis_rangeslider_visible=False, dragmode="pan")
-    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displaylogo": False})
+    st.plotly_chart(
+        make_underlying_chart(bars, symbol, option_side),
+        use_container_width=True,
+        config={"scrollZoom": True, "displaylogo": False}
+    )
 else:
     st.info("No underlying chart data returned.")
 
