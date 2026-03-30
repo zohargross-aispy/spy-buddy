@@ -522,10 +522,58 @@ def run_backtest(df: pd.DataFrame, timeframe_label: str):
     return bt, {"stats": stats}
 
 def build_options_plan(signal: str, premium_entry: float, stop_pct: float, tp1_pct: float, tp2_pct: float, min_rr: float) -> dict:
+    if signal in ["EXIT BUY", "EXIT SELL"]:
+        return {
+            "enabled": True,
+            "status": "Close the open options position now.",
+            "premium_stop": None,
+            "premium_tp1": None,
+            "premium_tp2": None,
+            "rr1": None,
+            "rr2": None,
+            "trade_ok": False,
+            "mode": "exit",
+        }
+
+    if signal == "NO TRADE":
+        return {
+            "enabled": True,
+            "status": "No valid options setup right now. Wait.",
+            "premium_stop": None,
+            "premium_tp1": None,
+            "premium_tp2": None,
+            "rr1": None,
+            "rr2": None,
+            "trade_ok": False,
+            "mode": "wait",
+        }
+
     if premium_entry <= 0:
-        return {"enabled": False, "status": "No option premium entered.", "premium_stop": None, "premium_tp1": None, "premium_tp2": None, "rr1": None, "rr2": None, "trade_ok": None}
+        return {
+            "enabled": True,
+            "status": "Enter an option premium to calculate stop and targets.",
+            "premium_stop": None,
+            "premium_tp1": None,
+            "premium_tp2": None,
+            "rr1": None,
+            "rr2": None,
+            "trade_ok": None,
+            "mode": "need_entry",
+        }
+
     if signal not in ["BUY", "SELL", "HOLD BUY", "HOLD SELL"]:
-        return {"enabled": True, "status": "Options plan only applies to active long or short trade states.", "premium_stop": None, "premium_tp1": None, "premium_tp2": None, "rr1": None, "rr2": None, "trade_ok": False}
+        return {
+            "enabled": True,
+            "status": "Options plan only applies to active long or short trade states.",
+            "premium_stop": None,
+            "premium_tp1": None,
+            "premium_tp2": None,
+            "rr1": None,
+            "rr2": None,
+            "trade_ok": False,
+            "mode": "inactive",
+        }
+
     risk_amt = premium_entry * (stop_pct / 100.0)
     premium_stop = max(0.01, premium_entry - risk_amt)
     premium_tp1 = premium_entry * (1 + tp1_pct / 100.0)
@@ -534,7 +582,17 @@ def build_options_plan(signal: str, premium_entry: float, stop_pct: float, tp1_p
     rr2 = (premium_tp2 - premium_entry) / max(0.0001, premium_entry - premium_stop)
     trade_ok = rr1 >= min_rr
     status = "Options setup passes minimum reward/risk." if trade_ok else "NO TRADE for options. Reward/risk is below your minimum."
-    return {"enabled": True, "status": status, "premium_stop": premium_stop, "premium_tp1": premium_tp1, "premium_tp2": premium_tp2, "rr1": rr1, "rr2": rr2, "trade_ok": trade_ok}
+    return {
+        "enabled": True,
+        "status": status,
+        "premium_stop": premium_stop,
+        "premium_tp1": premium_tp1,
+        "premium_tp2": premium_tp2,
+        "rr1": rr1,
+        "rr2": rr2,
+        "trade_ok": trade_ok,
+        "mode": "active",
+    }
 
 def make_candlestick_chart(df: pd.DataFrame, symbol: str, timeframe_label: str):
     chart_df = df.tail(TF_MAP[timeframe_label]["chart_bars"]).copy()
@@ -684,11 +742,22 @@ try:
     if options_mode:
         st.subheader("🎯 Daily Options Plan")
         o1, o2, o3, o4, o5 = st.columns(5)
-        o1.metric("Entry Premium", fmt_price(premium_entry) if premium_entry > 0 else "N/A")
-        o2.metric("Premium Stop", fmt_price(options_plan["premium_stop"]))
-        o3.metric("TP1", fmt_price(options_plan["premium_tp1"]))
-        o4.metric("TP2", fmt_price(options_plan["premium_tp2"]))
-        o5.metric("R/R to TP1", "N/A" if options_plan["rr1"] is None else f"{options_plan['rr1']:.2f}")
+        entry_label = fmt_price(premium_entry) if premium_entry > 0 else "Enter premium"
+        stop_label = fmt_price(options_plan["premium_stop"]) if options_plan["premium_stop"] is not None else ("Close now" if options_plan.get("mode") == "exit" else "Wait")
+        tp1_label = fmt_price(options_plan["premium_tp1"]) if options_plan["premium_tp1"] is not None else ("Close now" if options_plan.get("mode") == "exit" else "Wait")
+        tp2_label = fmt_price(options_plan["premium_tp2"]) if options_plan["premium_tp2"] is not None else ("Close now" if options_plan.get("mode") == "exit" else "Wait")
+        rr1_label = "N/A" if options_plan["rr1"] is None else f"{options_plan['rr1']:.2f}"
+        o1.metric("Entry Premium", entry_label)
+        o2.metric("Premium Stop", stop_label)
+        o3.metric("TP1", tp1_label)
+        o4.metric("TP2", tp2_label)
+        o5.metric("R/R to TP1", rr1_label)
+        if options_plan.get("mode") in ["exit", "wait", "need_entry", "inactive"]:
+            st.info(options_plan["status"])
+        elif options_plan["trade_ok"] is False:
+            st.warning(options_plan["status"])
+        elif options_plan["trade_ok"] is True:
+            st.success(options_plan["status"])
     st.subheader(f"{symbol} Chart")
     if PLOTLY_AVAILABLE:
         st.plotly_chart(make_candlestick_chart(entry_df, symbol, timeframe), use_container_width=True, config={"scrollZoom": True, "displaylogo": False, "displayModeBar": False})
