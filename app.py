@@ -636,11 +636,11 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str, timeframe_label: str):
     for _, row in exit_sell_points.iterrows():
         y_val = row["Low"] - (row["ATR"] * 0.18 if pd.notna(row["ATR"]) else row["Low"] * 0.002)
         fig.add_annotation(x=row["index"], y=y_val, xref="x", yref="y2", text=row["label"], showarrow=True, arrowhead=2, arrowsize=1.0, arrowwidth=2, arrowcolor="orange", ax=0, ay=35, font=dict(color="orange", size=10), align="center")
-    fig.update_layout(title=f"{symbol} Candlestick + Structure / RSI / MACD", xaxis_rangeslider_visible=False, height=940, legend_orientation="h", dragmode="pan", hovermode=False)
-    fig.update_yaxes(title_text="Volume", row=1, col=1, secondary_y=False, showgrid=False)
-    fig.update_yaxes(title_text="Price", row=1, col=1, secondary_y=True)
-    fig.update_yaxes(title_text="RSI", row=2, col=1)
-    fig.update_yaxes(title_text="MACD", row=3, col=1)
+    fig.update_layout(title=f"{symbol} Candlestick + Structure / RSI / MACD", xaxis_rangeslider_visible=False, height=940, legend_orientation="h", dragmode="zoom", hovermode=False)
+    fig.update_yaxes(title_text="Volume", row=1, col=1, secondary_y=False, showgrid=False, fixedrange=False)
+    fig.update_yaxes(title_text="Price", row=1, col=1, secondary_y=True, fixedrange=False)
+    fig.update_yaxes(title_text="RSI", row=2, col=1, fixedrange=False)
+    fig.update_yaxes(title_text="MACD", row=3, col=1, fixedrange=False)
     return fig
 
 def make_backtest_chart(bt_df: pd.DataFrame):
