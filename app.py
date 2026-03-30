@@ -5,6 +5,16 @@ import urllib.error
 from typing import Tuple
 
 import streamlit as st
+refresh_ms = 30000 if timeframe != "1 Day" else 60000
+if AUTOREFRESH_AVAILABLE:
+    st_autorefresh(interval=refresh_ms, key=f"autorefresh_{timeframe}")
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+    AUTOREFRESH_AVAILABLE = True
+except Exception:
+    AUTOREFRESH_AVAILABLE = False
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -140,7 +150,7 @@ def add_live_daily_bar(daily_df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     if intraday.empty:
         return daily_df
 
-    today = pd.Timestamp.now(tz="America/New_York").normalize()
+    today = pd.Timestamp.now(tz="America/New_York").normalize().tz_localize(None)
     today_rows = intraday[intraday.index.normalize() == today]
     if today_rows.empty:
         return daily_df
@@ -151,15 +161,15 @@ def add_live_daily_bar(daily_df: pd.DataFrame, symbol: str) -> pd.DataFrame:
         "Low": [float(today_rows["Low"].min())],
         "Close": [float(today_rows["Close"].iloc[-1])],
         "Volume": [float(today_rows["Volume"].sum())],
-    }, index=[today.tz_localize(None)])
+    }, index=[today])
 
     out = daily_df.copy()
     out.index = pd.to_datetime(out.index)
     if getattr(out.index, "tz", None) is not None:
         out.index = out.index.tz_convert(None)
 
-    if today.tz_localize(None) in out.index:
-        out.loc[today.tz_localize(None), ["Open", "High", "Low", "Close", "Volume"]] = live_bar.iloc[0][["Open", "High", "Low", "Close", "Volume"]]
+    if today in out.index:
+        out.loc[today, ["Open", "High", "Low", "Close", "Volume"]] = live_bar.iloc[0][["Open", "High", "Low", "Close", "Volume"]]
     else:
         out = pd.concat([out, live_bar])
 
@@ -754,6 +764,165 @@ def build_options_plan(signal: str, premium_entry: float, stop_pct: float, tp1_p
     }
 
 
+def make_candlestick_chart(df: pd.DataFrame, symbol: str, timeframe_label: str):
+    chart_bars = TF_MAP[timeframe_label]["chart_bars"]
+    chart_df = df.tail(chart_bars).copy()
+
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        row_heights=[0.62, 0.18, 0.20],
+        specs=[[{"secondary_y": True}], [{}], [{}]]
+    )
+
+    fig.add_trace(
+        go.Candlestick(
+            x=chart_df.index,
+            open=chart_df["Open"],
+            high=chart_df["High"],
+            low=chart_df["Low"],
+            close=chart_df["Close"],
+            name="Candles"
+        ),
+        row=1, col=1, secondary_y=True
+    )
+
+    price_lines = [
+        ("EMA_8", "rgba(99, 102, 241, 0.90)", "solid"),
+        ("EMA_21", "rgba(245, 158, 11, 0.95)", "solid"),
+        ("EMA_50", "rgba(14, 165, 233, 0.95)", "solid"),
+        ("EMA_200", "rgba(244, 63, 94, 0.90)", "solid"),
+        ("VWAP", "rgba(168, 85, 247, 0.95)", "solid"),
+        ("PREV_DAY_HIGH", "rgba(34, 197, 94, 0.60)", "dash"),
+        ("PREV_DAY_LOW", "rgba(239, 68, 68, 0.60)", "dash"),
+        ("OPENING_RANGE_HIGH", "rgba(250, 204, 21, 0.65)", "dot"),
+        ("OPENING_RANGE_LOW", "rgba(250, 204, 21, 0.65)", "dot"),
+    ]
+
+    for col, color, dash in price_lines:
+        if col in chart_df.columns and chart_df[col].notna().sum() > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=chart_df.index,
+                    y=chart_df[col],
+                    mode="lines",
+                    name=col,
+                    line=dict(color=color, dash=dash, width=1.6)
+                ),
+                row=1, col=1, secondary_y=True
+            )
+
+    volume_colors = np.where(
+        chart_df["Close"] >= chart_df["Open"],
+        "rgba(34, 197, 94, 0.30)",
+        "rgba(239, 68, 68, 0.30)"
+    )
+    fig.add_trace(
+        go.Bar(
+            x=chart_df.index,
+            y=chart_df["Volume"],
+            name="Volume",
+            marker_color=volume_colors,
+            opacity=0.45
+        ),
+        row=1, col=1, secondary_y=False
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=chart_df.index,
+            y=chart_df["RSI"],
+            mode="lines",
+            name="RSI",
+            line=dict(color="rgba(59, 130, 246, 0.95)", width=1.8)
+        ),
+        row=2, col=1
+    )
+    fig.add_hline(y=70, row=2, col=1, line_dash="dot", line_color="rgba(239, 68, 68, 0.55)")
+    fig.add_hline(y=30, row=2, col=1, line_dash="dot", line_color="rgba(34, 197, 94, 0.55)")
+
+    fig.add_trace(
+        go.Scatter(
+            x=chart_df.index,
+            y=chart_df["MACD"],
+            mode="lines",
+            name="MACD",
+            line=dict(color="rgba(59, 130, 246, 0.95)", width=1.8)
+        ),
+        row=3, col=1
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=chart_df.index,
+            y=chart_df["MACD_SIGNAL"],
+            mode="lines",
+            name="MACD Signal",
+            line=dict(color="rgba(245, 158, 11, 0.95)", width=1.8)
+        ),
+        row=3, col=1
+    )
+    fig.add_trace(
+        go.Bar(
+            x=chart_df.index,
+            y=chart_df["MACD_HIST"],
+            name="MACD Hist",
+            marker_color=np.where(
+                chart_df["MACD_HIST"] >= 0,
+                "rgba(34, 197, 94, 0.65)",
+                "rgba(239, 68, 68, 0.65)"
+            ),
+            opacity=0.45
+        ),
+        row=3, col=1
+    )
+
+    buy_points, sell_points = find_chart_signals(chart_df)
+    if not buy_points.empty:
+        buy_points = buy_points.tail(20)
+    if not sell_points.empty:
+        sell_points = sell_points.tail(20)
+
+    for _, row in buy_points.iterrows():
+        y_val = row["Low"] - (row["ATR"] * 0.25 if pd.notna(row["ATR"]) else row["Low"] * 0.003)
+        fig.add_annotation(
+            x=row["index"], y=y_val, xref="x", yref="y2", text=row["label"],
+            showarrow=True, arrowhead=2, arrowsize=1.2, arrowwidth=2,
+            arrowcolor="green", ax=0, ay=38, font=dict(color="green", size=10), align="center"
+        )
+
+    for _, row in sell_points.iterrows():
+        y_val = row["High"] + (row["ATR"] * 0.25 if pd.notna(row["ATR"]) else row["High"] * 0.003)
+        fig.add_annotation(
+            x=row["index"], y=y_val, xref="x", yref="y2", text=row["label"],
+            showarrow=True, arrowhead=2, arrowsize=1.2, arrowwidth=2,
+            arrowcolor="red", ax=0, ay=-42, font=dict(color="red", size=10), align="center"
+        )
+
+    fig.update_layout(
+        title=f"{symbol} Candlestick + Structure / RSI / MACD",
+        xaxis_rangeslider_visible=False,
+        height=940,
+        legend_orientation="h",
+        dragmode="pan",
+        hovermode="x unified"
+    )
+    fig.update_yaxes(title_text="Volume", row=1, col=1, secondary_y=False, showgrid=False)
+    fig.update_yaxes(title_text="Price", row=1, col=1, secondary_y=True)
+    fig.update_yaxes(title_text="RSI", row=2, col=1)
+    fig.update_yaxes(title_text="MACD", row=3, col=1)
+    return fig
+
+
+def make_backtest_chart(bt_df: pd.DataFrame):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=bt_df.index, y=bt_df["equity_curve"], mode="lines", name="Strategy", line=dict(width=2)))
+    fig.add_trace(go.Scatter(x=bt_df.index, y=bt_df["buy_hold_curve"], mode="lines", name="Buy & Hold", line=dict(width=2, dash="dot")))
+    fig.update_layout(title="Backtest Equity Curve", height=460, dragmode="pan")
+    return fig
+
+
 with st.sidebar:
     st.header("Controls")
     symbol = st.text_input("Ticker", value=DEFAULT_SYMBOL).upper().strip()
@@ -779,6 +948,9 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
+refresh_ms = 30000 if timeframe != "1 Day" else 60000
+if AUTOREFRESH_AVAILABLE:
+    st_autorefresh(interval=refresh_ms, key=f"autorefresh_{timeframe}")
 
 try:
     cfg = TF_MAP[timeframe]
