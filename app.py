@@ -317,7 +317,7 @@ def find_chart_signals(df: pd.DataFrame, option_side: str):
 
         if fresh_buy:
             buy_rows.append({
-                "index": idx,
+                "index": row["Time"],
                 "Low": row["Low"],
                 "ATR": 0 if pd.isna(row.get("ATR")) else row.get("ATR", 0),
                 "label": f"BUY<br>{float(row['Close']):.2f}",
@@ -325,7 +325,7 @@ def find_chart_signals(df: pd.DataFrame, option_side: str):
 
         if fresh_sell:
             sell_rows.append({
-                "index": idx,
+                "index": row["Time"],
                 "High": row["High"],
                 "ATR": 0 if pd.isna(row.get("ATR")) else row.get("ATR", 0),
                 "label": f"SELL<br>{float(row['Close']):.2f}",
