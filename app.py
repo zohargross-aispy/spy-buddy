@@ -269,14 +269,15 @@ def stock_signal(df: pd.DataFrame) -> tuple[str, int, list]:
 
 
 
-def state_series(df: pd.DataFrame, option_side: str) -> pd.DataFrame:
+
+def state_series(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if out.empty:
         out["state"] = []
         return out
 
     states = []
-    prev_state = "NO TRADE"
+    mode = "FLAT"
 
     for _, row in out.iterrows():
         score = 0
@@ -295,31 +296,37 @@ def state_series(df: pd.DataFrame, option_side: str) -> pd.DataFrame:
         weakening_long = (row["Close"] < row["EMA_8"]) or (pd.notna(row["RSI"]) and row["RSI"] < 48)
         weakening_short = (row["Close"] > row["EMA_8"]) or (pd.notna(row["RSI"]) and row["RSI"] > 52)
 
-        if option_side.upper() == "CALL":
+        state = "NO TRADE"
+
+        if mode == "FLAT":
             if bullish:
-                state = "BUY" if prev_state not in ["BUY", "HOLD BUY"] else "HOLD BUY"
-            elif prev_state in ["BUY", "HOLD BUY"] and weakening_long:
+                state = "BUY"
+                mode = "LONG"
+            elif bearish:
+                state = "SELL"
+                mode = "SHORT"
+        elif mode == "LONG":
+            if bearish or weakening_long:
                 state = "EXIT BUY"
+                mode = "FLAT"
             else:
-                state = "NO TRADE"
-        else:
-            if bearish:
-                state = "SELL" if prev_state not in ["SELL", "HOLD SELL"] else "HOLD SELL"
-            elif prev_state in ["SELL", "HOLD SELL"] and weakening_short:
+                state = "HOLD BUY"
+        elif mode == "SHORT":
+            if bullish or weakening_short:
                 state = "EXIT SELL"
+                mode = "FLAT"
             else:
-                state = "NO TRADE"
+                state = "HOLD SELL"
 
         states.append(state)
-        prev_state = state
 
     out["state"] = states
     out["prev_state"] = out["state"].shift(1)
     return out
 
 
-def find_chart_signals(df: pd.DataFrame, option_side: str):
-    marked = state_series(df, option_side)
+def find_chart_signals(df: pd.DataFrame):
+    marked = state_series(df)
     buy_rows, sell_rows, exit_buy_rows, exit_sell_rows = [], [], [], []
 
     for _, row in marked.iterrows():
@@ -349,10 +356,16 @@ def find_chart_signals(df: pd.DataFrame, option_side: str):
         pd.DataFrame(exit_sell_rows),
     )
 
-def make_underlying_chart(df: pd.DataFrame, symbol: str, option_side: str):
-    chart_df = df.tail(140).copy()
-    fig = go.Figure()
 
+def make_underlying_chart(df: pd.DataFrame, symbol: str):
+    chart_df = df.copy()
+    if chart_df.empty:
+        return go.Figure()
+
+    chart_df["Time"] = pd.to_datetime(chart_df["Time"], errors="coerce")
+    chart_df = chart_df.dropna(subset=["Time"]).sort_values("Time").tail(140).copy()
+
+    fig = go.Figure()
     fig.add_trace(go.Candlestick(
         x=chart_df["Time"],
         open=chart_df["Open"],
@@ -371,10 +384,10 @@ def make_underlying_chart(df: pd.DataFrame, symbol: str, option_side: str):
                 name=col
             ))
 
-    buy_points, sell_points, exit_buy_points, exit_sell_points = find_chart_signals(chart_df, option_side)
+    buy_points, sell_points, exit_buy_points, exit_sell_points = find_chart_signals(chart_df)
 
     if not buy_points.empty:
-        for _, row in buy_points.tail(20).iterrows():
+        for _, row in buy_points.tail(8).iterrows():
             fig.add_annotation(
                 x=row["index"],
                 y=row["Low"] - max(float(row["ATR"]) * 0.2, 0.05),
@@ -388,7 +401,7 @@ def make_underlying_chart(df: pd.DataFrame, symbol: str, option_side: str):
             )
 
     if not sell_points.empty:
-        for _, row in sell_points.tail(20).iterrows():
+        for _, row in sell_points.tail(8).iterrows():
             fig.add_annotation(
                 x=row["index"],
                 y=row["High"] + max(float(row["ATR"]) * 0.2, 0.05),
@@ -401,11 +414,43 @@ def make_underlying_chart(df: pd.DataFrame, symbol: str, option_side: str):
                 ay=-35,
             )
 
+    if not exit_buy_points.empty:
+        for _, row in exit_buy_points.tail(8).iterrows():
+            fig.add_annotation(
+                x=row["index"],
+                y=row["High"] + max(float(row["ATR"]) * 0.15, 0.05),
+                text=row["label"],
+                showarrow=True,
+                arrowhead=2,
+                arrowcolor="orange",
+                font=dict(color="orange", size=10),
+                ax=0,
+                ay=-30,
+            )
+
+    if not exit_sell_points.empty:
+        for _, row in exit_sell_points.tail(8).iterrows():
+            fig.add_annotation(
+                x=row["index"],
+                y=row["Low"] - max(float(row["ATR"]) * 0.15, 0.05),
+                text=row["label"],
+                showarrow=True,
+                arrowhead=2,
+                arrowcolor="orange",
+                font=dict(color="orange", size=10),
+                ax=0,
+                ay=30,
+            )
+
+    x_start = chart_df["Time"].iloc[0]
+    x_end = chart_df["Time"].iloc[-1]
+
     fig.update_layout(
         height=560,
         xaxis_rangeslider_visible=False,
         dragmode="pan",
         hovermode="x unified",
+        xaxis=dict(type="date", range=[x_start, x_end]),
     )
     return fig
 
@@ -929,7 +974,7 @@ else:
 st.subheader("Underlying Chart")
 if not bars.empty:
     st.plotly_chart(
-        make_underlying_chart(bars, symbol, option_side),
+        make_underlying_chart(bars, symbol),
         use_container_width=True,
         config={"scrollZoom": True, "displaylogo": False}
     )
