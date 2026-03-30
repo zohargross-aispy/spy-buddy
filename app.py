@@ -558,6 +558,204 @@ def current_signal(entry_df: pd.DataFrame, hourly_df: pd.DataFrame, daily_df: pd
     }
 
 
+
+def vector_signal_score(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["score"] = 0
+
+    out["score"] += np.where(out["Close"] > out["EMA_21"], 1, -1)
+    out["score"] += np.where(out["EMA_21"] > out["EMA_50"], 1, -1)
+    out["score"] += np.where(out["EMA_50"] > out["EMA_200"], 1, -1)
+
+    out["score"] += np.where((out["RSI"] >= 52) & (out["RSI"] <= 68), 1, 0)
+    out["score"] += np.where(out["RSI"] < 45, -1, 0)
+    out["score"] += np.where(out["RSI"] > 72, -1, 0)
+
+    out["score"] += np.where(out["MACD_HIST"] > 0, 1, -1)
+    out["score"] += np.where(out["Volume"] > out["VOL_AVG_20"], 1, 0)
+
+    if "VIX_CLOSE" in out.columns:
+        out["score"] += np.where(out["VIX_CLOSE"] < 18, 1, 0)
+        out["score"] += np.where(out["VIX_CLOSE"] > 24, -2, 0)
+
+    if "VWAP" in out.columns:
+        out["score"] += np.where(pd.notna(out["VWAP"]) & (out["Close"] > out["VWAP"]), 1, 0)
+        out["score"] += np.where(pd.notna(out["VWAP"]) & (out["Close"] < out["VWAP"]), -1, 0)
+
+    if "PREV_DAY_HIGH" in out.columns:
+        out["score"] += np.where(pd.notna(out["PREV_DAY_HIGH"]) & (out["Close"] > out["PREV_DAY_HIGH"]), 1, 0)
+    if "PREV_DAY_LOW" in out.columns:
+        out["score"] += np.where(pd.notna(out["PREV_DAY_LOW"]) & (out["Close"] < out["PREV_DAY_LOW"]), -1, 0)
+
+    if "OPENING_RANGE_HIGH" in out.columns:
+        out["score"] += np.where(pd.notna(out["OPENING_RANGE_HIGH"]) & (out["Close"] > out["OPENING_RANGE_HIGH"]), 1, 0)
+    if "OPENING_RANGE_LOW" in out.columns:
+        out["score"] += np.where(pd.notna(out["OPENING_RANGE_LOW"]) & (out["Close"] < out["OPENING_RANGE_LOW"]), -1, 0)
+
+    atr_dist = abs(out["Close"] - out["EMA_21"]) / out["ATR"].replace(0, np.nan)
+    out["extended"] = atr_dist > 1.8
+    out["score"] += np.where(out["extended"], -1, 0)
+
+    out["signal_label"] = np.select(
+        [
+            out["score"] >= 8,
+            out["score"] <= -5,
+            (out["score"] >= 3) & (out["score"] <= 7),
+        ],
+        [
+            "BUY",
+            "SELL",
+            "HOLD",
+        ],
+        default="NO TRADE"
+    )
+
+    return out
+
+
+def find_chart_signals(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    marked = vector_signal_score(df.copy())
+    marked["prev_signal"] = marked["signal_label"].shift(1)
+
+    marked["fresh_buy"] = (marked["signal_label"] == "BUY") & (marked["prev_signal"] != "BUY")
+    marked["fresh_sell"] = (marked["signal_label"] == "SELL") & (marked["prev_signal"] != "SELL")
+
+    buy_rows = []
+    sell_rows = []
+    open_trade = None
+
+    for idx, row in marked.iterrows():
+        if row["fresh_buy"]:
+            buy_label = f"BUY<br>{float(row['Close']):.2f}"
+            buy_rows.append({
+                "index": idx,
+                "Low": row["Low"],
+                "High": row["High"],
+                "ATR": row["ATR"],
+                "Close": row["Close"],
+                "label": buy_label,
+            })
+            open_trade = {
+                "index": idx,
+                "price": float(row["Close"]),
+            }
+
+        elif row["fresh_sell"]:
+            sell_label = f"SELL<br>{float(row['Close']):.2f}"
+
+            if open_trade is not None:
+                pnl_pct = ((float(row["Close"]) / open_trade["price"]) - 1.0) * 100.0
+                sell_label = f"SELL<br>{float(row['Close']):.2f}<br>{pnl_pct:+.2f}%"
+                open_trade = None
+
+            sell_rows.append({
+                "index": idx,
+                "Low": row["Low"],
+                "High": row["High"],
+                "ATR": row["ATR"],
+                "Close": row["Close"],
+                "label": sell_label,
+            })
+
+    buy_points = pd.DataFrame(buy_rows)
+    sell_points = pd.DataFrame(sell_rows)
+
+    return buy_points, sell_points
+
+
+def run_backtest(df: pd.DataFrame, timeframe_label: str):
+    bt = df.copy()
+    bt = vector_signal_score(bt)
+    bt = bt.dropna(subset=["EMA_21", "EMA_50", "EMA_200", "RSI", "MACD_HIST", "ATR"]).copy()
+
+    if bt.empty or len(bt) < 80:
+        return None, None
+
+    position = []
+    in_pos = 0
+
+    for _, row in bt.iterrows():
+        enter_long = row["score"] >= 8 and not row["extended"]
+        hold_long = row["score"] >= 3 and row["Close"] > row["EMA_50"]
+        exit_long = row["score"] <= 1 or row["Close"] < row["EMA_21"]
+
+        if in_pos == 0 and enter_long:
+            in_pos = 1
+        elif in_pos == 1 and exit_long and not hold_long:
+            in_pos = 0
+
+        position.append(in_pos)
+
+    bt["position"] = position
+    bt["ret"] = bt["Close"].pct_change().fillna(0)
+    bt["strategy_ret"] = bt["ret"] * bt["position"].shift(1).fillna(0)
+    bt["equity_curve"] = (1 + bt["strategy_ret"]).cumprod()
+    bt["buy_hold_curve"] = (1 + bt["ret"]).cumprod()
+
+    bt["equity_peak"] = bt["equity_curve"].cummax()
+    bt["drawdown"] = bt["equity_curve"] / bt["equity_peak"] - 1
+
+    bt["position_change"] = bt["position"].diff().fillna(0)
+    entries = bt.index[bt["position_change"] == 1].tolist()
+    exits = bt.index[bt["position_change"] == -1].tolist()
+
+    if len(exits) < len(entries):
+        exits.append(bt.index[-1])
+
+    trades = []
+    for entry_time, exit_time in zip(entries, exits):
+        entry_price = bt.loc[entry_time, "Close"]
+        exit_price = bt.loc[exit_time, "Close"]
+        trade_return = (exit_price / entry_price) - 1
+        trades.append({
+            "Entry Time": entry_time,
+            "Exit Time": exit_time,
+            "Entry Price": round(float(entry_price), 2),
+            "Exit Price": round(float(exit_price), 2),
+            "Return %": round(trade_return * 100, 2),
+        })
+
+    trades_df = pd.DataFrame(trades)
+
+    total_return = (bt["equity_curve"].iloc[-1] - 1) * 100
+    buy_hold_return = (bt["buy_hold_curve"].iloc[-1] - 1) * 100
+    max_drawdown = bt["drawdown"].min() * 100
+    total_trades = len(trades_df)
+
+    if total_trades > 0:
+        win_rate = (trades_df["Return %"] > 0).mean() * 100
+        avg_trade = trades_df["Return %"].mean()
+        gross_profit = trades_df.loc[trades_df["Return %"] > 0, "Return %"].sum()
+        gross_loss = abs(trades_df.loc[trades_df["Return %"] < 0, "Return %"].sum())
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.nan
+    else:
+        win_rate = 0.0
+        avg_trade = 0.0
+        profit_factor = np.nan
+
+    exposure = bt["position"].mean() * 100
+
+    bars_year = TF_MAP[timeframe_label]["bars_year"]
+    sharpe = np.nan
+    std = bt["strategy_ret"].std()
+    if pd.notna(std) and std > 0:
+        sharpe = (bt["strategy_ret"].mean() / std) * np.sqrt(bars_year)
+
+    stats = {
+        "Strategy Return %": round(total_return, 2),
+        "Buy & Hold %": round(buy_hold_return, 2),
+        "Max Drawdown %": round(max_drawdown, 2),
+        "Trades": int(total_trades),
+        "Win Rate %": round(win_rate, 2),
+        "Avg Trade %": round(avg_trade, 2),
+        "Profit Factor": None if pd.isna(profit_factor) else round(float(profit_factor), 2),
+        "Exposure %": round(float(exposure), 2),
+        "Sharpe": None if pd.isna(sharpe) else round(float(sharpe), 2),
+    }
+
+    return bt, {"stats": stats, "trades": trades_df}
+
+
 def build_options_plan(
     signal: str,
     premium_entry: float,
