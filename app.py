@@ -201,6 +201,8 @@ def get_stock_bars(symbol:str,timeframe:str="5Min",limit:int=150)->pd.DataFrame:
     df=pd.DataFrame(bars)
     df["Time"]=pd.to_datetime(df["t"],utc=True).dt.tz_convert("America/New_York")
     df=df.rename(columns={"o":"Open","h":"High","l":"Low","c":"Close","v":"Volume"})
+    for col in ["Open","High","Low","Close","Volume"]:
+        df[col]=pd.to_numeric(df[col],errors="coerce").astype("float64")
     return df[["Time","Open","High","Low","Close","Volume"]]
 
 @st.cache_data(ttl=60)
@@ -243,6 +245,13 @@ def add_indicators(df:pd.DataFrame)->pd.DataFrame:
     out=df.copy()
     if out.empty or len(out)<10: return out
 
+    # ── Force all OHLCV columns to float64 to prevent DataError on rolling ──
+    for col in ["Open","High","Low","Close","Volume"]:
+        if col in out.columns:
+            out[col]=pd.to_numeric(out[col],errors="coerce").astype("float64")
+    out=out.dropna(subset=["Close"])
+    if out.empty or len(out)<10: return out
+
     # ── Original indicators ────────────────────────────────────────────────
     out["EMA_8"] =out["Close"].ewm(span=8, adjust=False).mean()
     out["EMA_21"]=out["Close"].ewm(span=21,adjust=False).mean()
@@ -252,8 +261,8 @@ def add_indicators(df:pd.DataFrame)->pd.DataFrame:
     gain=delta.clip(lower=0); loss=-delta.clip(upper=0)
     avg_gain=gain.ewm(alpha=1/14,adjust=False).mean()
     avg_loss=loss.ewm(alpha=1/14,adjust=False).mean()
-    rs=avg_gain/avg_loss.replace(0,pd.NA)
-    out["RSI"]=100-(100/(1+rs))
+    rs=avg_gain/avg_loss.replace(0,np.nan)
+    out["RSI"]=(100-(100/(1+rs))).astype("float64")
 
     # ── MACD ──────────────────────────────────────────────────────────────
     ema12=out["Close"].ewm(span=12,adjust=False).mean()
@@ -263,9 +272,10 @@ def add_indicators(df:pd.DataFrame)->pd.DataFrame:
     out["MACD_hist"]=out["MACD"]-out["MACD_signal"]
 
     # ── Stochastic RSI ────────────────────────────────────────────────────
-    rsi_min=out["RSI"].rolling(14).min()
-    rsi_max=out["RSI"].rolling(14).max()
-    stoch_rsi=(out["RSI"]-rsi_min)/(rsi_max-rsi_min+1e-9)
+    rsi_series=out["RSI"].astype("float64")
+    rsi_min=rsi_series.rolling(14).min()
+    rsi_max=rsi_series.rolling(14).max()
+    stoch_rsi=(rsi_series-rsi_min)/(rsi_max-rsi_min+1e-9)
     out["StochRSI_K"]=stoch_rsi.rolling(3).mean()*100
     out["StochRSI_D"]=out["StochRSI_K"].rolling(3).mean()
 
