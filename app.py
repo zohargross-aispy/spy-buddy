@@ -464,12 +464,71 @@ def current_signal(entry_df: pd.DataFrame, hourly_df: pd.DataFrame, daily_df: pd
     risk = "Medium"
 
     if atr is not None and atr > 0:
+        buffer = 0.18 * atr
+
         if signal == "BUY":
-            stop = close - 1.2 * atr
-            target = close + 2.2 * atr
+            support_candidates = sorted(
+                [
+                    float(v) for v in [
+                        row.get("VWAP", np.nan),
+                        row.get("EMA_8", np.nan),
+                        row.get("EMA_21", np.nan),
+                        row.get("OPENING_RANGE_LOW", np.nan),
+                        row.get("PREV_DAY_HIGH", np.nan),
+                        row.get("PREV_DAY_LOW", np.nan),
+                    ]
+                    if pd.notna(v) and float(v) < float(close)
+                ],
+                reverse=True,
+            )
+            structure_stop = support_candidates[0] if support_candidates else float(close - 0.9 * atr)
+            stop = structure_stop - buffer
+
+            risk_dist = max(float(close - stop), float(0.55 * atr))
+            target_candidates = sorted(
+                [
+                    float(v) for v in [
+                        row.get("OPENING_RANGE_HIGH", np.nan),
+                        row.get("PREV_DAY_HIGH", np.nan),
+                        close + 1.15 * risk_dist,
+                        close + 1.0 * atr,
+                    ]
+                    if pd.notna(v) and float(v) > float(close)
+                ]
+            )
+            target = target_candidates[0] if target_candidates else float(close + 1.15 * risk_dist)
+
         elif signal == "SELL":
-            stop = close + 1.2 * atr
-            target = close - 2.2 * atr
+            resistance_candidates = sorted(
+                [
+                    float(v) for v in [
+                        row.get("VWAP", np.nan),
+                        row.get("EMA_8", np.nan),
+                        row.get("EMA_21", np.nan),
+                        row.get("OPENING_RANGE_HIGH", np.nan),
+                        row.get("PREV_DAY_LOW", np.nan),
+                        row.get("PREV_DAY_HIGH", np.nan),
+                    ]
+                    if pd.notna(v) and float(v) > float(close)
+                ]
+            )
+            structure_stop = resistance_candidates[0] if resistance_candidates else float(close + 0.9 * atr)
+            stop = structure_stop + buffer
+
+            risk_dist = max(float(stop - close), float(0.55 * atr))
+            target_candidates = sorted(
+                [
+                    float(v) for v in [
+                        row.get("OPENING_RANGE_LOW", np.nan),
+                        row.get("PREV_DAY_LOW", np.nan),
+                        close - 1.15 * risk_dist,
+                        close - 1.0 * atr,
+                    ]
+                    if pd.notna(v) and float(v) < float(close)
+                ],
+                reverse=True,
+            )
+            target = target_candidates[0] if target_candidates else float(close - 1.15 * risk_dist)
 
     if vix_value > 24:
         risk = "High"
@@ -668,10 +727,9 @@ def run_backtest(df: pd.DataFrame, timeframe_label: str):
 
     bars_year = TF_MAP[timeframe_label]["bars_year"]
     sharpe = np.nan
-    if bt["strategy_ret"].std() not in [0, np.nan] and pd.notna(bt["strategy_ret"].std()):
-        std = bt["strategy_ret"].std()
-        if std > 0:
-            sharpe = (bt["strategy_ret"].mean() / std) * np.sqrt(bars_year)
+    std = bt["strategy_ret"].std()
+    if pd.notna(std) and std > 0:
+        sharpe = (bt["strategy_ret"].mean() / std) * np.sqrt(bars_year)
 
     stats = {
         "Strategy Return %": round(total_return, 2),
@@ -714,7 +772,7 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str, timeframe_label: str):
         row=1, col=1, secondary_y=True
     )
 
-    # EMAs + VWAP -> RIGHT axis
+    # EMAs + VWAP + levels -> RIGHT axis
     price_lines = [
         ("EMA_8", "rgba(99, 102, 241, 0.90)", "solid"),
         ("EMA_21", "rgba(245, 158, 11, 0.95)", "solid"),
@@ -741,7 +799,11 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str, timeframe_label: str):
             )
 
     # Volume -> LEFT axis
-    volume_colors = np.where(chart_df["Close"] >= chart_df["Open"], "rgba(34, 197, 94, 0.30)", "rgba(239, 68, 68, 0.30)")
+    volume_colors = np.where(
+        chart_df["Close"] >= chart_df["Open"],
+        "rgba(34, 197, 94, 0.30)",
+        "rgba(239, 68, 68, 0.30)"
+    )
     fig.add_trace(
         go.Bar(
             x=chart_df.index,
