@@ -1,3 +1,4 @@
+
 import json
 import urllib.request
 import urllib.error
@@ -24,9 +25,6 @@ except Exception:
     GENAI_AVAILABLE = False
 
 
-# ----------------------------
-# PAGE CONFIG
-# ----------------------------
 st.set_page_config(
     page_title="SPY Buddy Pro Elite X",
     page_icon="📈",
@@ -34,12 +32,9 @@ st.set_page_config(
 )
 
 st.title("📈 SPY Buddy Pro Elite X")
-st.caption("Research / education dashboard. Not financial advice.")
+st.caption("Lean chart view. Research / education only, not financial advice.")
 
 
-# ----------------------------
-# CONFIG
-# ----------------------------
 TF_MAP = {
     "1 Day": {"period": "2y", "interval": "1d", "bars_year": 252, "chart_bars": 220},
     "1 Hour": {"period": "730d", "interval": "1h", "bars_year": 252 * 7, "chart_bars": 220},
@@ -58,9 +53,6 @@ OPENING_RANGE_BARS = {
 DEFAULT_SYMBOL = "SPY"
 
 
-# ----------------------------
-# HELPERS
-# ----------------------------
 def safe_round(x, digits=2):
     if x is None or pd.isna(x):
         return None
@@ -71,12 +63,6 @@ def fmt_price(x):
     if x is None or pd.isna(x):
         return "N/A"
     return f"${float(x):,.2f}"
-
-
-def fmt_pct(x):
-    if x is None or pd.isna(x):
-        return "N/A"
-    return f"{float(x):.2f}%"
 
 
 def signal_color(signal: str) -> str:
@@ -111,23 +97,74 @@ def send_webhook_alert(webhook_url: str, payload: dict) -> Tuple[bool, str]:
         return False, str(e)
 
 
-def _normalized_dates(index_like) -> pd.Series:
-    idx = pd.to_datetime(index_like)
+def _normalize_index(idx_like):
+    idx = pd.to_datetime(idx_like)
     if getattr(idx, "tz", None) is not None:
-        idx = idx.tz_convert(None)
+        try:
+            idx = idx.tz_convert("America/New_York")
+        except Exception:
+            idx = idx.tz_convert(None)
+    return idx
+
+
+def _normalized_dates(index_like) -> pd.Series:
+    idx = _normalize_index(index_like)
     return pd.Series(idx).dt.normalize()
 
 
 def is_intraday_df(df: pd.DataFrame) -> bool:
     if df.empty or len(df.index) < 2:
         return False
-    idx = pd.to_datetime(df.index)
-    if getattr(idx, "tz", None) is not None:
-        idx = idx.tz_convert(None)
+    idx = _normalize_index(df.index)
     diffs = pd.Series(idx).diff().dropna()
     if diffs.empty:
         return False
     return diffs.median() < pd.Timedelta(days=1)
+
+
+def add_live_daily_bar(daily_df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """
+    Append an in-progress daily bar built from recent intraday data.
+    This lets the 1 Day chart show today's session instead of only the last completed day.
+    """
+    if daily_df.empty:
+        return daily_df
+
+    intraday = yf.Ticker(symbol).history(period="5d", interval="1m", auto_adjust=False)
+    if intraday is None or intraday.empty:
+        return daily_df
+
+    intraday = intraday.copy()
+    intraday.index = _normalize_index(intraday.index)
+    intraday = intraday[intraday.index.notna()]
+    if intraday.empty:
+        return daily_df
+
+    today = pd.Timestamp.now(tz="America/New_York").normalize()
+    today_rows = intraday[intraday.index.normalize() == today]
+    if today_rows.empty:
+        return daily_df
+
+    live_bar = pd.DataFrame({
+        "Open": [float(today_rows["Open"].iloc[0])],
+        "High": [float(today_rows["High"].max())],
+        "Low": [float(today_rows["Low"].min())],
+        "Close": [float(today_rows["Close"].iloc[-1])],
+        "Volume": [float(today_rows["Volume"].sum())],
+    }, index=[today.tz_localize(None)])
+
+    out = daily_df.copy()
+    out.index = pd.to_datetime(out.index)
+    if getattr(out.index, "tz", None) is not None:
+        out.index = out.index.tz_convert(None)
+
+    if today.tz_localize(None) in out.index:
+        out.loc[today.tz_localize(None), ["Open", "High", "Low", "Close", "Volume"]] = live_bar.iloc[0][["Open", "High", "Low", "Close", "Volume"]]
+    else:
+        out = pd.concat([out, live_bar])
+
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    return out
 
 
 def add_indicators(df: pd.DataFrame, timeframe_label: str) -> pd.DataFrame:
@@ -136,13 +173,11 @@ def add_indicators(df: pd.DataFrame, timeframe_label: str) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # EMAs
     df["EMA_8"] = df["Close"].ewm(span=8, adjust=False).mean()
     df["EMA_21"] = df["Close"].ewm(span=21, adjust=False).mean()
     df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["EMA_200"] = df["Close"].ewm(span=200, adjust=False).mean()
 
-    # RSI (14)
     delta = df["Close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -151,24 +186,20 @@ def add_indicators(df: pd.DataFrame, timeframe_label: str) -> pd.DataFrame:
     rs = avg_gain / avg_loss.replace(0, np.nan)
     df["RSI"] = 100 - (100 / (1 + rs))
 
-    # MACD
     ema12 = df["Close"].ewm(span=12, adjust=False).mean()
     ema26 = df["Close"].ewm(span=26, adjust=False).mean()
     df["MACD"] = ema12 - ema26
     df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
     df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
 
-    # ATR (14)
     high_low = df["High"] - df["Low"]
     high_close = (df["High"] - df["Close"].shift()).abs()
     low_close = (df["Low"] - df["Close"].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["ATR"] = tr.rolling(14).mean()
 
-    # Volume average
     df["VOL_AVG_20"] = df["Volume"].rolling(20).mean() if "Volume" in df.columns else np.nan
 
-    # Session VWAP for intraday charts
     if is_intraday_df(df) and "Volume" in df.columns:
         session_dates = _normalized_dates(df.index).values
         typical_price = (df["High"] + df["Low"] + df["Close"]) / 3.0
@@ -180,7 +211,6 @@ def add_indicators(df: pd.DataFrame, timeframe_label: str) -> pd.DataFrame:
     else:
         df["VWAP"] = np.nan
 
-    # Structure placeholders
     df["PREV_DAY_HIGH"] = np.nan
     df["PREV_DAY_LOW"] = np.nan
     df["OPENING_RANGE_HIGH"] = np.nan
@@ -279,7 +309,6 @@ def timeframe_bias(df: pd.DataFrame) -> int:
 
     row = df.iloc[-1]
     score = 0
-
     score += 1 if row["Close"] > row["EMA_21"] else -1
     score += 1 if row["EMA_21"] > row["EMA_50"] else -1
 
@@ -346,97 +375,89 @@ def current_signal(entry_df: pd.DataFrame, hourly_df: pd.DataFrame, daily_df: pd
 
     if row["Close"] > row["EMA_21"]:
         score += 1
-        reasons.append("Price is above EMA21.")
+        reasons.append("Price above EMA21.")
     else:
         score -= 1
-        reasons.append("Price is below EMA21.")
+        reasons.append("Price below EMA21.")
 
     if row["EMA_21"] > row["EMA_50"]:
         score += 1
-        reasons.append("EMA21 is above EMA50.")
+        reasons.append("EMA21 above EMA50.")
     else:
         score -= 1
-        reasons.append("EMA21 is below EMA50.")
+        reasons.append("EMA21 below EMA50.")
 
     if not pd.isna(row["EMA_200"]):
         if row["EMA_50"] > row["EMA_200"]:
             score += 1
-            reasons.append("EMA50 is above EMA200.")
+            reasons.append("EMA50 above EMA200.")
         else:
             score -= 1
-            reasons.append("EMA50 is below EMA200.")
+            reasons.append("EMA50 below EMA200.")
 
     if 52 <= row["RSI"] <= 68:
         score += 1
-        reasons.append("RSI is in a healthy bullish zone.")
+        reasons.append("RSI healthy.")
     elif row["RSI"] < 45:
         score -= 1
-        reasons.append("RSI is weak.")
+        reasons.append("RSI weak.")
     elif row["RSI"] > 72:
         score -= 1
-        reasons.append("RSI is stretched / overheated.")
+        reasons.append("RSI stretched.")
 
     if row["MACD_HIST"] > 0:
         score += 1
-        reasons.append("MACD histogram is positive.")
+        reasons.append("MACD histogram positive.")
     else:
         score -= 1
-        reasons.append("MACD histogram is negative.")
+        reasons.append("MACD histogram negative.")
 
     if "Volume" in entry_df.columns and not pd.isna(row["VOL_AVG_20"]):
         if row["Volume"] > row["VOL_AVG_20"]:
             score += 1
-            reasons.append("Volume is above the 20-bar average.")
-        else:
-            reasons.append("Volume is not strongly confirming.")
+            reasons.append("Volume confirms.")
 
     if pd.notna(row.get("VWAP", np.nan)):
         if row["Close"] > row["VWAP"]:
             score += 1
-            reasons.append("Price is above VWAP.")
+            reasons.append("Price above VWAP.")
         else:
             score -= 1
-            reasons.append("Price is below VWAP.")
+            reasons.append("Price below VWAP.")
 
     if pd.notna(row.get("PREV_DAY_HIGH", np.nan)) and row["Close"] > row["PREV_DAY_HIGH"]:
         score += 1
-        reasons.append("Price is above the previous day high.")
+        reasons.append("Above previous day high.")
     elif pd.notna(row.get("PREV_DAY_LOW", np.nan)) and row["Close"] < row["PREV_DAY_LOW"]:
         score -= 1
-        reasons.append("Price is below the previous day low.")
+        reasons.append("Below previous day low.")
 
     if pd.notna(row.get("OPENING_RANGE_HIGH", np.nan)) and row["Close"] > row["OPENING_RANGE_HIGH"]:
         score += 1
-        reasons.append("Price is above the opening range high.")
+        reasons.append("Above opening range high.")
     elif pd.notna(row.get("OPENING_RANGE_LOW", np.nan)) and row["Close"] < row["OPENING_RANGE_LOW"]:
         score -= 1
-        reasons.append("Price is below the opening range low.")
+        reasons.append("Below opening range low.")
 
     if vix_value < 18:
         score += 1
-        reasons.append("VIX is supportive.")
+        reasons.append("VIX supportive.")
     elif vix_value > 24:
         score -= 2
-        reasons.append("VIX is elevated and raises risk.")
-    else:
-        reasons.append("VIX is neutral.")
+        reasons.append("VIX elevated.")
 
     htf = timeframe_bias(hourly_df)
     dtf = timeframe_bias(daily_df)
 
     if htf >= 2:
         score += 1
-        reasons.append("Hourly trend confirms.")
     elif htf <= -2:
         score -= 1
-        reasons.append("Hourly trend disagrees.")
 
     if dtf >= 2:
         score += 2
-        reasons.append("Daily trend confirms.")
     elif dtf <= -2:
         score -= 2
-        reasons.append("Daily trend disagrees.")
 
     extended = False
     if not pd.isna(row["ATR"]) and row["ATR"] > 0:
@@ -444,7 +465,7 @@ def current_signal(entry_df: pd.DataFrame, hourly_df: pd.DataFrame, daily_df: pd
         if dist > 1.8:
             extended = True
             score -= 1
-            reasons.append("Price is extended versus ATR and EMA21.")
+            reasons.append("Extended versus ATR.")
 
     regime = detect_market_regime(daily_df, vix_value)
 
@@ -468,64 +489,50 @@ def current_signal(entry_df: pd.DataFrame, hourly_df: pd.DataFrame, daily_df: pd
 
         if signal == "BUY":
             support_candidates = sorted(
-                [
-                    float(v) for v in [
-                        row.get("VWAP", np.nan),
-                        row.get("EMA_8", np.nan),
-                        row.get("EMA_21", np.nan),
-                        row.get("OPENING_RANGE_LOW", np.nan),
-                        row.get("PREV_DAY_HIGH", np.nan),
-                        row.get("PREV_DAY_LOW", np.nan),
-                    ]
-                    if pd.notna(v) and float(v) < float(close)
-                ],
+                [float(v) for v in [
+                    row.get("VWAP", np.nan),
+                    row.get("EMA_8", np.nan),
+                    row.get("EMA_21", np.nan),
+                    row.get("OPENING_RANGE_LOW", np.nan),
+                    row.get("PREV_DAY_HIGH", np.nan),
+                    row.get("PREV_DAY_LOW", np.nan),
+                ] if pd.notna(v) and float(v) < float(close)],
                 reverse=True,
             )
             structure_stop = support_candidates[0] if support_candidates else float(close - 0.9 * atr)
             stop = structure_stop - buffer
-
             risk_dist = max(float(close - stop), float(0.55 * atr))
             target_candidates = sorted(
-                [
-                    float(v) for v in [
-                        row.get("OPENING_RANGE_HIGH", np.nan),
-                        row.get("PREV_DAY_HIGH", np.nan),
-                        close + 1.15 * risk_dist,
-                        close + 1.0 * atr,
-                    ]
-                    if pd.notna(v) and float(v) > float(close)
-                ]
+                [float(v) for v in [
+                    row.get("OPENING_RANGE_HIGH", np.nan),
+                    row.get("PREV_DAY_HIGH", np.nan),
+                    close + 1.15 * risk_dist,
+                    close + 1.0 * atr,
+                ] if pd.notna(v) and float(v) > float(close)]
             )
             target = target_candidates[0] if target_candidates else float(close + 1.15 * risk_dist)
 
         elif signal == "SELL":
             resistance_candidates = sorted(
-                [
-                    float(v) for v in [
-                        row.get("VWAP", np.nan),
-                        row.get("EMA_8", np.nan),
-                        row.get("EMA_21", np.nan),
-                        row.get("OPENING_RANGE_HIGH", np.nan),
-                        row.get("PREV_DAY_LOW", np.nan),
-                        row.get("PREV_DAY_HIGH", np.nan),
-                    ]
-                    if pd.notna(v) and float(v) > float(close)
-                ]
+                [float(v) for v in [
+                    row.get("VWAP", np.nan),
+                    row.get("EMA_8", np.nan),
+                    row.get("EMA_21", np.nan),
+                    row.get("OPENING_RANGE_HIGH", np.nan),
+                    row.get("PREV_DAY_LOW", np.nan),
+                    row.get("PREV_DAY_HIGH", np.nan),
+                ] if pd.notna(v) and float(v) > float(close)]
             )
             structure_stop = resistance_candidates[0] if resistance_candidates else float(close + 0.9 * atr)
             stop = structure_stop + buffer
-
             risk_dist = max(float(stop - close), float(0.55 * atr))
             target_candidates = sorted(
-                [
-                    float(v) for v in [
-                        row.get("OPENING_RANGE_LOW", np.nan),
-                        row.get("PREV_DAY_LOW", np.nan),
-                        close - 1.15 * risk_dist,
-                        close - 1.0 * atr,
-                    ]
-                    if pd.notna(v) and float(v) < float(close)
-                ],
+                [float(v) for v in [
+                    row.get("OPENING_RANGE_LOW", np.nan),
+                    row.get("PREV_DAY_LOW", np.nan),
+                    close - 1.15 * risk_dist,
+                    close - 1.0 * atr,
+                ] if pd.notna(v) and float(v) < float(close)],
                 reverse=True,
             )
             target = target_candidates[0] if target_candidates else float(close - 1.15 * risk_dist)
@@ -556,11 +563,9 @@ def vector_signal_score(df: pd.DataFrame) -> pd.DataFrame:
     out["score"] += np.where(out["Close"] > out["EMA_21"], 1, -1)
     out["score"] += np.where(out["EMA_21"] > out["EMA_50"], 1, -1)
     out["score"] += np.where(out["EMA_50"] > out["EMA_200"], 1, -1)
-
     out["score"] += np.where((out["RSI"] >= 52) & (out["RSI"] <= 68), 1, 0)
     out["score"] += np.where(out["RSI"] < 45, -1, 0)
     out["score"] += np.where(out["RSI"] > 72, -1, 0)
-
     out["score"] += np.where(out["MACD_HIST"] > 0, 1, -1)
     out["score"] += np.where(out["Volume"] > out["VOL_AVG_20"], 1, 0)
 
@@ -587,61 +592,40 @@ def vector_signal_score(df: pd.DataFrame) -> pd.DataFrame:
     out["score"] += np.where(out["extended"], -1, 0)
 
     out["signal_label"] = np.select(
-        [
-            out["score"] >= 8,
-            out["score"] <= -5,
-            (out["score"] >= 3) & (out["score"] <= 7),
-        ],
-        [
-            "BUY",
-            "SELL",
-            "HOLD",
-        ],
+        [out["score"] >= 8, out["score"] <= -5, (out["score"] >= 3) & (out["score"] <= 7)],
+        ["BUY", "SELL", "HOLD"],
         default="NO TRADE"
     )
-
     return out
 
 
 def find_chart_signals(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     marked = vector_signal_score(df.copy())
     marked["prev_signal"] = marked["signal_label"].shift(1)
-
     marked["fresh_buy"] = (marked["signal_label"] == "BUY") & (marked["prev_signal"] != "BUY")
     marked["fresh_sell"] = (marked["signal_label"] == "SELL") & (marked["prev_signal"] != "SELL")
 
-    buy_rows = []
-    sell_rows = []
+    buy_rows, sell_rows = [], []
     open_trade = None
 
     for idx, row in marked.iterrows():
         if row["fresh_buy"]:
-            buy_label = f"BUY<br>{float(row['Close']):.2f}"
             buy_rows.append({
-                "index": idx,
-                "Low": row["Low"],
-                "High": row["High"],
-                "ATR": row["ATR"],
-                "Close": row["Close"],
-                "label": buy_label,
+                "index": idx, "Low": row["Low"], "High": row["High"], "ATR": row["ATR"],
+                "Close": row["Close"], "label": f"BUY<br>{float(row['Close']):.2f}",
             })
             open_trade = {"index": idx, "price": float(row["Close"])}
 
         elif row["fresh_sell"]:
             sell_label = f"SELL<br>{float(row['Close']):.2f}"
-
             if open_trade is not None:
                 pnl_pct = ((float(row["Close"]) / open_trade["price"]) - 1.0) * 100.0
                 sell_label = f"SELL<br>{float(row['Close']):.2f}<br>{pnl_pct:+.2f}%"
                 open_trade = None
 
             sell_rows.append({
-                "index": idx,
-                "Low": row["Low"],
-                "High": row["High"],
-                "ATR": row["ATR"],
-                "Close": row["Close"],
-                "label": sell_label,
+                "index": idx, "Low": row["Low"], "High": row["High"], "ATR": row["ATR"],
+                "Close": row["Close"], "label": sell_label,
             })
 
     return pd.DataFrame(buy_rows), pd.DataFrame(sell_rows)
@@ -667,7 +651,6 @@ def run_backtest(df: pd.DataFrame, timeframe_label: str):
             in_pos = 1
         elif in_pos == 1 and exit_long and not hold_long:
             in_pos = 0
-
         position.append(in_pos)
 
     bt["position"] = position
@@ -675,14 +658,12 @@ def run_backtest(df: pd.DataFrame, timeframe_label: str):
     bt["strategy_ret"] = bt["ret"] * bt["position"].shift(1).fillna(0)
     bt["equity_curve"] = (1 + bt["strategy_ret"]).cumprod()
     bt["buy_hold_curve"] = (1 + bt["ret"]).cumprod()
-
     bt["equity_peak"] = bt["equity_curve"].cummax()
     bt["drawdown"] = bt["equity_curve"] / bt["equity_peak"] - 1
-
     bt["position_change"] = bt["position"].diff().fillna(0)
+
     entries = bt.index[bt["position_change"] == 1].tolist()
     exits = bt.index[bt["position_change"] == -1].tolist()
-
     if len(exits) < len(entries):
         exits.append(bt.index[-1])
 
@@ -700,7 +681,6 @@ def run_backtest(df: pd.DataFrame, timeframe_label: str):
         })
 
     trades_df = pd.DataFrame(trades)
-
     total_return = (bt["equity_curve"].iloc[-1] - 1) * 100
     buy_hold_return = (bt["buy_hold_curve"].iloc[-1] - 1) * 100
     max_drawdown = bt["drawdown"].min() * 100
@@ -742,42 +722,29 @@ def run_backtest(df: pd.DataFrame, timeframe_label: str):
 def build_options_plan(signal: str, premium_entry: float, stop_pct: float, tp1_pct: float, tp2_pct: float, min_rr: float) -> dict:
     if premium_entry <= 0:
         return {
-            "enabled": False,
-            "status": "No option premium entered.",
-            "premium_stop": None,
-            "premium_tp1": None,
-            "premium_tp2": None,
-            "rr1": None,
-            "rr2": None,
-            "trade_ok": None,
+            "enabled": False, "status": "No option premium entered.",
+            "premium_stop": None, "premium_tp1": None, "premium_tp2": None,
+            "rr1": None, "rr2": None, "trade_ok": None,
         }
 
     if signal not in ["BUY", "SELL"]:
         return {
-            "enabled": True,
-            "status": "Options plan only activates on BUY or SELL.",
-            "premium_stop": None,
-            "premium_tp1": None,
-            "premium_tp2": None,
-            "rr1": None,
-            "rr2": None,
-            "trade_ok": False,
+            "enabled": True, "status": "Options plan only activates on BUY or SELL.",
+            "premium_stop": None, "premium_tp1": None, "premium_tp2": None,
+            "rr1": None, "rr2": None, "trade_ok": False,
         }
 
     risk_amt = premium_entry * (stop_pct / 100.0)
     premium_stop = max(0.01, premium_entry - risk_amt)
     premium_tp1 = premium_entry * (1 + tp1_pct / 100.0)
     premium_tp2 = premium_entry * (1 + tp2_pct / 100.0)
-
     rr1 = (premium_tp1 - premium_entry) / max(0.0001, premium_entry - premium_stop)
     rr2 = (premium_tp2 - premium_entry) / max(0.0001, premium_entry - premium_stop)
     trade_ok = rr1 >= min_rr
 
-    status = "Options setup passes minimum reward/risk." if trade_ok else "NO TRADE for options. Reward/risk is below your minimum."
-
     return {
         "enabled": True,
-        "status": status,
+        "status": "Options setup passes minimum reward/risk." if trade_ok else "NO TRADE for options. Reward/risk is below your minimum.",
         "premium_stop": premium_stop,
         "premium_tp1": premium_tp1,
         "premium_tp2": premium_tp2,
@@ -785,192 +752,6 @@ def build_options_plan(signal: str, premium_entry: float, stop_pct: float, tp1_p
         "rr2": rr2,
         "trade_ok": trade_ok,
     }
-
-
-def make_candlestick_chart(df: pd.DataFrame, symbol: str, timeframe_label: str):
-    chart_bars = TF_MAP[timeframe_label]["chart_bars"]
-    chart_df = df.tail(chart_bars).copy()
-
-    fig = make_subplots(
-        rows=3,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.03,
-        row_heights=[0.62, 0.18, 0.20],
-        specs=[[{"secondary_y": True}], [{}], [{}]]
-    )
-
-    fig.add_trace(
-        go.Candlestick(
-            x=chart_df.index,
-            open=chart_df["Open"],
-            high=chart_df["High"],
-            low=chart_df["Low"],
-            close=chart_df["Close"],
-            name="Candles"
-        ),
-        row=1, col=1, secondary_y=True
-    )
-
-    price_lines = [
-        ("EMA_8", "rgba(99, 102, 241, 0.90)", "solid"),
-        ("EMA_21", "rgba(245, 158, 11, 0.95)", "solid"),
-        ("EMA_50", "rgba(14, 165, 233, 0.95)", "solid"),
-        ("EMA_200", "rgba(244, 63, 94, 0.90)", "solid"),
-        ("VWAP", "rgba(168, 85, 247, 0.95)", "solid"),
-        ("PREV_DAY_HIGH", "rgba(34, 197, 94, 0.60)", "dash"),
-        ("PREV_DAY_LOW", "rgba(239, 68, 68, 0.60)", "dash"),
-        ("OPENING_RANGE_HIGH", "rgba(250, 204, 21, 0.65)", "dot"),
-        ("OPENING_RANGE_LOW", "rgba(250, 204, 21, 0.65)", "dot"),
-    ]
-
-    for col, color, dash in price_lines:
-        if col in chart_df.columns and chart_df[col].notna().sum() > 0:
-            fig.add_trace(
-                go.Scatter(
-                    x=chart_df.index,
-                    y=chart_df[col],
-                    mode="lines",
-                    name=col,
-                    line=dict(color=color, dash=dash, width=1.6)
-                ),
-                row=1, col=1, secondary_y=True
-            )
-
-    volume_colors = np.where(
-        chart_df["Close"] >= chart_df["Open"],
-        "rgba(34, 197, 94, 0.30)",
-        "rgba(239, 68, 68, 0.30)"
-    )
-    fig.add_trace(
-        go.Bar(
-            x=chart_df.index,
-            y=chart_df["Volume"],
-            name="Volume",
-            marker_color=volume_colors,
-            opacity=0.45
-        ),
-        row=1, col=1, secondary_y=False
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=chart_df.index,
-            y=chart_df["RSI"],
-            mode="lines",
-            name="RSI",
-            line=dict(color="rgba(59, 130, 246, 0.95)", width=1.8)
-        ),
-        row=2, col=1
-    )
-    fig.add_hline(y=70, row=2, col=1, line_dash="dot", line_color="rgba(239, 68, 68, 0.55)")
-    fig.add_hline(y=30, row=2, col=1, line_dash="dot", line_color="rgba(34, 197, 94, 0.55)")
-
-    fig.add_trace(
-        go.Scatter(
-            x=chart_df.index,
-            y=chart_df["MACD"],
-            mode="lines",
-            name="MACD",
-            line=dict(color="rgba(59, 130, 246, 0.95)", width=1.8)
-        ),
-        row=3, col=1
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=chart_df.index,
-            y=chart_df["MACD_SIGNAL"],
-            mode="lines",
-            name="MACD Signal",
-            line=dict(color="rgba(245, 158, 11, 0.95)", width=1.8)
-        ),
-        row=3, col=1
-    )
-    fig.add_trace(
-        go.Bar(
-            x=chart_df.index,
-            y=chart_df["MACD_HIST"],
-            name="MACD Hist",
-            marker_color=np.where(
-                chart_df["MACD_HIST"] >= 0,
-                "rgba(34, 197, 94, 0.65)",
-                "rgba(239, 68, 68, 0.65)"
-            ),
-            opacity=0.45
-        ),
-        row=3, col=1
-    )
-
-    buy_points, sell_points = find_chart_signals(chart_df)
-
-    if not buy_points.empty:
-        buy_points = buy_points.tail(20)
-    if not sell_points.empty:
-        sell_points = sell_points.tail(20)
-
-    for _, row in buy_points.iterrows():
-        x_val = row["index"]
-        y_val = row["Low"] - (row["ATR"] * 0.25 if pd.notna(row["ATR"]) else row["Low"] * 0.003)
-        fig.add_annotation(
-            x=x_val, y=y_val, xref="x", yref="y2", text=row["label"],
-            showarrow=True, arrowhead=2, arrowsize=1.2, arrowwidth=2,
-            arrowcolor="green", ax=0, ay=38,
-            font=dict(color="green", size=10), align="center"
-        )
-
-    for _, row in sell_points.iterrows():
-        x_val = row["index"]
-        y_val = row["High"] + (row["ATR"] * 0.25 if pd.notna(row["ATR"]) else row["High"] * 0.003)
-        fig.add_annotation(
-            x=x_val, y=y_val, xref="x", yref="y2", text=row["label"],
-            showarrow=True, arrowhead=2, arrowsize=1.2, arrowwidth=2,
-            arrowcolor="red", ax=0, ay=-42,
-            font=dict(color="red", size=10), align="center"
-        )
-
-    fig.update_layout(
-        title=f"{symbol} Candlestick + Structure / RSI / MACD",
-        xaxis_rangeslider_visible=False,
-        height=940,
-        legend_orientation="h",
-        dragmode="pan",
-        hovermode="x unified"
-    )
-
-    fig.update_yaxes(title_text="Volume", row=1, col=1, secondary_y=False, showgrid=False)
-    fig.update_yaxes(title_text="Price", row=1, col=1, secondary_y=True)
-    fig.update_yaxes(title_text="RSI", row=2, col=1)
-    fig.update_yaxes(title_text="MACD", row=3, col=1)
-
-    return fig
-
-
-def make_backtest_chart(bt_df: pd.DataFrame):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=bt_df.index, y=bt_df["equity_curve"], mode="lines", name="Strategy", line=dict(width=2)))
-    fig.add_trace(go.Scatter(x=bt_df.index, y=bt_df["buy_hold_curve"], mode="lines", name="Buy & Hold", line=dict(width=2, dash="dot")))
-    fig.update_layout(title="Backtest Equity Curve", height=460, dragmode="pan")
-    return fig
-
-
-@st.cache_data(ttl=60)
-def get_history(symbol: str, period: str, interval: str) -> pd.DataFrame:
-    df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df = df.copy()
-    df = df[~df.index.duplicated(keep="last")]
-    return df
-
-
-@st.cache_data(ttl=60)
-def get_all_data(symbol: str, timeframe_label: str):
-    cfg = TF_MAP[timeframe_label]
-    entry = get_history(symbol, cfg["period"], cfg["interval"])
-    hourly = get_history(symbol, "60d", "1h")
-    daily = get_history(symbol, "2y", "1d")
-    vix = get_history("^VIX", "6mo", "1d")
-    return entry, hourly, daily, vix
 
 
 with st.sidebar:
@@ -982,22 +763,17 @@ with st.sidebar:
     st.subheader("Options Mode")
     options_mode = st.checkbox("Use daily options mode", value=True)
     premium_entry = st.number_input("Option entry premium ($)", min_value=0.0, value=0.0, step=0.05)
-    stop_loss_pct = st.slider("Premium stop loss %", min_value=10, max_value=40, value=20, step=1)
-    take_profit_1_pct = st.slider("Premium take profit 1 %", min_value=15, max_value=80, value=35, step=1)
-    take_profit_2_pct = st.slider("Premium take profit 2 %", min_value=25, max_value=150, value=60, step=1)
-    min_rr = st.slider("Minimum reward/risk", min_value=1.0, max_value=3.0, value=1.5, step=0.1)
+    stop_loss_pct = st.slider("Premium stop loss %", 10, 40, 20, 1)
+    take_profit_1_pct = st.slider("Premium take profit 1 %", 15, 80, 35, 1)
+    take_profit_2_pct = st.slider("Premium take profit 2 %", 25, 150, 60, 1)
+    min_rr = st.slider("Minimum reward/risk", 1.0, 3.0, 1.5, 0.1)
 
     st.divider()
     st.subheader("Backtest")
-    backtest_bars = st.slider("Bars to backtest", min_value=120, max_value=2000, value=500, step=20)
+    backtest_bars = st.slider("Bars to backtest", 120, 2000, 500, 20)
 
     st.divider()
-    st.subheader("Alerts")
-    enable_webhook = st.checkbox("Enable webhook alerts", value=False)
-    webhook_url = st.text_input("Webhook URL", value="", type="password", help="Paste a Discord, Slack-compatible, or automation webhook URL.")
-
-    st.divider()
-    show_ai = st.checkbox("Enable AI panel", value=True)
+    show_ai = st.checkbox("Enable AI panel", value=False)
 
     if st.button("🔄 Refresh Data", use_container_width=True):
         st.cache_data.clear()
@@ -1005,7 +781,15 @@ with st.sidebar:
 
 
 try:
-    entry_raw, hourly_raw, daily_raw, vix_raw = get_all_data(symbol, timeframe)
+    cfg = TF_MAP[timeframe]
+    entry_raw = yf.Ticker(symbol).history(period=cfg["period"], interval=cfg["interval"], auto_adjust=False)
+    hourly_raw = yf.Ticker(symbol).history(period="60d", interval="1h", auto_adjust=False)
+    daily_raw = yf.Ticker(symbol).history(period="2y", interval="1d", auto_adjust=False)
+    vix_raw = yf.Ticker("^VIX").history(period="6mo", interval="1d", auto_adjust=False)
+
+    if timeframe == "1 Day":
+        entry_raw = add_live_daily_bar(entry_raw, symbol)
+        daily_raw = add_live_daily_bar(daily_raw, symbol)
 
     if entry_raw.empty:
         st.error(f"No data returned for {symbol}.")
@@ -1048,65 +832,14 @@ try:
         tp2_pct=float(take_profit_2_pct),
         min_rr=float(min_rr),
     ) if options_mode else {
-        "enabled": False,
-        "status": "Options mode is off.",
-        "premium_stop": None,
-        "premium_tp1": None,
-        "premium_tp2": None,
-        "rr1": None,
-        "rr2": None,
-        "trade_ok": None,
+        "enabled": False, "status": "Options mode is off.",
+        "premium_stop": None, "premium_tp1": None, "premium_tp2": None,
+        "rr1": None, "rr2": None, "trade_ok": None,
     }
 
     display_signal = sig["signal"]
     if options_mode and options_plan["enabled"] and options_plan["trade_ok"] is False:
         display_signal = "NO TRADE"
-
-    alert_key = f"last_signal_{symbol}_{timeframe}"
-    history_key = f"alert_history_{symbol}_{timeframe}"
-
-    if history_key not in st.session_state:
-        st.session_state[history_key] = []
-
-    prev_signal = st.session_state.get(alert_key)
-
-    if prev_signal is None:
-        st.session_state[alert_key] = display_signal
-
-    elif prev_signal != display_signal:
-        event_time = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-        alert_row = {
-            "Time": event_time,
-            "Old Signal": prev_signal,
-            "New Signal": display_signal,
-            "Price": curr_price,
-            "Ticker": symbol,
-            "Timeframe": timeframe,
-            "Confidence": sig["confidence"],
-            "Risk": sig["risk"],
-        }
-
-        st.session_state[history_key].insert(0, alert_row)
-        st.session_state[alert_key] = display_signal
-        st.warning(f"Signal changed: {prev_signal} → {display_signal} at {fmt_price(curr_price)}")
-
-        toast_icon = {"BUY": "🟢", "HOLD": "🔵", "SELL": "🔴", "NO TRADE": "🟠"}.get(display_signal, "📈")
-        st.toast(f"{symbol} {timeframe}: {prev_signal} → {display_signal} at {fmt_price(curr_price)}", icon=toast_icon)
-
-        if enable_webhook and webhook_url:
-            payload = {
-                "text": (
-                    f"{symbol} {timeframe} signal changed: "
-                    f"{prev_signal} -> {display_signal} | "
-                    f"Price: {curr_price} | "
-                    f"Confidence: {sig['confidence']}% | "
-                    f"Risk: {sig['risk']} | "
-                    f"Regime: {sig['regime']}"
-                )
-            }
-
-            ok, msg = send_webhook_alert(webhook_url, payload)
-            st.toast("Webhook alert sent" if ok else f"Webhook failed: {msg}", icon="✅" if ok else "❌")
 
     st.subheader(f"Signal: :{signal_color(display_signal)}[{display_signal}]")
 
@@ -1118,17 +851,11 @@ try:
     c5.metric("Risk", sig["risk"])
     c6.metric("Regime", sig["regime"])
 
-    d1, d2, d3, d4, d5, d6 = st.columns(6)
+    d1, d2, d3, d4 = st.columns(4)
     d1.metric("RSI", f"{safe_round(last['RSI'], 2)}")
     d2.metric("ATR", fmt_price(safe_round(last["ATR"], 2)))
-    d3.metric("VWAP", fmt_price(safe_round(last.get("VWAP", np.nan), 2)))
-    d4.metric("Prev Day High", fmt_price(safe_round(last.get("PREV_DAY_HIGH", np.nan), 2)))
-    d5.metric("Prev Day Low", fmt_price(safe_round(last.get("PREV_DAY_LOW", np.nan), 2)))
-    d6.metric("OR High", fmt_price(safe_round(last.get("OPENING_RANGE_HIGH", np.nan), 2)))
-
-    e1, e2 = st.columns(2)
-    e1.metric("Underlying Stop", fmt_price(safe_round(sig["stop"], 2)))
-    e2.metric("Underlying Target", fmt_price(safe_round(sig["target"], 2)))
+    d3.metric("Underlying Stop", fmt_price(safe_round(sig["stop"], 2)))
+    d4.metric("Underlying Target", fmt_price(safe_round(sig["target"], 2)))
 
     if options_mode:
         st.subheader("🎯 Daily Options Plan")
@@ -1137,11 +864,7 @@ try:
         o2.metric("Premium Stop", fmt_price(options_plan["premium_stop"]))
         o3.metric("TP1", fmt_price(options_plan["premium_tp1"]))
         o4.metric("TP2", fmt_price(options_plan["premium_tp2"]))
-        o5.metric("R/R to TP1", "N/A" if options_plan["rr1"] is None else f"{options_plan['rr1']:.2f}")
-
-        p1, p2 = st.columns(2)
-        p1.metric("R/R to TP2", "N/A" if options_plan["rr2"] is None else f"{options_plan['rr2']:.2f}")
-        p2.metric("Options Verdict", "OK" if options_plan["trade_ok"] else ("WAIT" if options_plan["trade_ok"] is False else "N/A"))
+        o5.metric("R/R TP1", "N/A" if options_plan["rr1"] is None else f"{options_plan['rr1']:.2f}")
 
         if options_plan["enabled"]:
             if options_plan["trade_ok"] is False:
@@ -1151,46 +874,14 @@ try:
             else:
                 st.info(options_plan["status"])
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Dashboard", "Backtest", "Alerts", "Raw Data"])
+    tab1, tab2, tab3 = st.tabs(["Chart", "Backtest", "Alerts"])
 
     with tab1:
-        with st.expander("How the engine decides"):
-            st.markdown(
-                """
-**BUY**
-- Price above EMA21, EMA50, and usually VWAP
-- Daily trend agrees
-- RSI healthy, MACD positive
-- Price behaves well vs previous-day and opening-range structure
-- VIX not too hot
-- Price not overly extended
-
-**HOLD**
-- Trend is okay, but setup is not strong enough for a fresh buy
-
-**SELL**
-- Trend and momentum break down
-- Higher timeframe disagrees
-- Price loses VWAP / structure
-- Risk rises
-
-**NO TRADE**
-- Signals are mixed
-- Price is too stretched
-- Volatility is hostile
-- Structure is messy
-- or your options reward/risk is below your minimum
-                """
-            )
-
-        st.subheader(f"{symbol} Chart")
-
         if PLOTLY_AVAILABLE:
             fig = make_candlestick_chart(entry_df, symbol, timeframe)
             st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displaylogo": False})
             st.caption("Mouse wheel zooms. Mouse drag pans left and right. Double-click resets.")
         else:
-            st.warning("Plotly is not installed, so showing a simpler chart without arrows or structure overlays.")
             fallback_cols = ["Close", "EMA_8", "EMA_21", "EMA_50"]
             if "EMA_200" in entry_df.columns and entry_df["EMA_200"].notna().sum() > 0:
                 fallback_cols.append("EMA_200")
@@ -1198,55 +889,21 @@ try:
                 fallback_cols.append("VWAP")
             st.line_chart(entry_df[fallback_cols].tail(TF_MAP[timeframe]["chart_bars"]))
 
-        left, right = st.columns([1.2, 1])
-
-        with left:
-            st.subheader("Why this signal")
-            for reason in sig["reasons"]:
-                st.write(f"- {reason}")
-
-        with right:
-            st.subheader("Latest Snapshot")
-            snap = pd.DataFrame({
-                "Close": [safe_round(last["Close"], 2)],
-                "VWAP": [safe_round(last.get("VWAP", np.nan), 2)],
-                "EMA_8": [safe_round(last["EMA_8"], 2)],
-                "EMA_21": [safe_round(last["EMA_21"], 2)],
-                "EMA_50": [safe_round(last["EMA_50"], 2)],
-                "EMA_200": [safe_round(last["EMA_200"], 2)],
-                "RSI": [safe_round(last["RSI"], 2)],
-                "MACD": [safe_round(last["MACD"], 3)],
-                "MACD_SIGNAL": [safe_round(last["MACD_SIGNAL"], 3)],
-                "MACD_HIST": [safe_round(last["MACD_HIST"], 3)],
-                "ATR": [safe_round(last["ATR"], 2)],
-                "PREV_DAY_HIGH": [safe_round(last.get("PREV_DAY_HIGH", np.nan), 2)],
-                "PREV_DAY_LOW": [safe_round(last.get("PREV_DAY_LOW", np.nan), 2)],
-                "OPENING_RANGE_HIGH": [safe_round(last.get("OPENING_RANGE_HIGH", np.nan), 2)],
-                "OPENING_RANGE_LOW": [safe_round(last.get("OPENING_RANGE_LOW", np.nan), 2)],
-                "VIX_CLOSE": [safe_round(last["VIX_CLOSE"], 2)],
-                "Volume": [int(last["Volume"]) if not pd.isna(last["Volume"]) else None],
-            })
-            st.dataframe(snap, use_container_width=True)
-
         if show_ai:
             st.subheader("🤖 AI Technical Verdict")
             api_key = st.secrets.get("GEMINI_API_KEY") or st.secrets.get("GOOGLE_API_KEY")
-
             if api_key and GENAI_AVAILABLE:
                 if st.button("Run Deep Analysis"):
                     prompt = f"""
 You are a disciplined institutional market strategist.
 
-Analyze this setup in 7 short bullet points:
+Analyze this setup in 5 short bullet points:
 1. Market regime
-2. What favors bulls
-3. What favors bears
-4. What structure matters now
-5. Best action now: BUY / HOLD / SELL / NO TRADE
-6. Key invalidation
-7. Tactical note
+2. Bull case
+3. Bear case
+4. Best action now
+5. Key invalidation
 
-Data:
 Ticker: {symbol}
 Timeframe: {timeframe}
 Price: {curr_price}
@@ -1256,26 +913,13 @@ Score: {sig['score']}
 Risk: {sig['risk']}
 Regime: {sig['regime']}
 VWAP: {safe_round(last.get('VWAP', np.nan), 2)}
-Prev Day High: {safe_round(last.get('PREV_DAY_HIGH', np.nan), 2)}
-Prev Day Low: {safe_round(last.get('PREV_DAY_LOW', np.nan), 2)}
-Opening Range High: {safe_round(last.get('OPENING_RANGE_HIGH', np.nan), 2)}
-Opening Range Low: {safe_round(last.get('OPENING_RANGE_LOW', np.nan), 2)}
 RSI: {safe_round(last['RSI'], 2)}
 ATR: {safe_round(last['ATR'], 2)}
-EMA8: {safe_round(last['EMA_8'], 2)}
 EMA21: {safe_round(last['EMA_21'], 2)}
 EMA50: {safe_round(last['EMA_50'], 2)}
-EMA200: {safe_round(last['EMA_200'], 2)}
-MACD: {safe_round(last['MACD'], 3)}
-MACD Signal: {safe_round(last['MACD_SIGNAL'], 3)}
-MACD Histogram: {safe_round(last['MACD_HIST'], 3)}
 VIX: {vix_value}
 Underlying stop: {safe_round(sig['stop'], 2)}
 Underlying target: {safe_round(sig['target'], 2)}
-Option premium entry: {premium_entry if premium_entry > 0 else 'N/A'}
-Option premium stop: {safe_round(options_plan['premium_stop'], 2)}
-Option premium TP1: {safe_round(options_plan['premium_tp1'], 2)}
-Option premium TP2: {safe_round(options_plan['premium_tp2'], 2)}
 """
                     with st.spinner("Running AI analysis..."):
                         client = genai.Client(api_key=api_key)
@@ -1285,7 +929,6 @@ Option premium TP2: {safe_round(options_plan['premium_tp2'], 2)}
                 st.caption("To enable AI, install `google-genai` and add `GEMINI_API_KEY` or `GOOGLE_API_KEY` to Streamlit secrets.")
 
     with tab2:
-        st.subheader("Advanced Backtest")
         bt_source = entry_df.tail(backtest_bars).copy()
         bt_df, bt_result = run_backtest(bt_source, timeframe)
 
@@ -1302,37 +945,13 @@ Option premium TP2: {safe_round(options_plan['premium_tp2'], 2)}
             b5.metric("Win Rate", f"{s['Win Rate %']}%")
             b6.metric("Avg Trade", f"{s['Avg Trade %']}%")
 
-            c7, c8, c9 = st.columns(3)
-            c7.metric("Profit Factor", "N/A" if s["Profit Factor"] is None else f"{s['Profit Factor']}")
-            c8.metric("Exposure", f"{s['Exposure %']}%")
-            c9.metric("Sharpe", "N/A" if s["Sharpe"] is None else f"{s['Sharpe']}")
-
             if PLOTLY_AVAILABLE:
                 st.plotly_chart(make_backtest_chart(bt_df), use_container_width=True, config={"scrollZoom": True, "displaylogo": False})
             else:
                 st.line_chart(bt_df[["equity_curve", "buy_hold_curve"]])
 
-            with st.expander("Backtest trade log"):
-                trades_df = bt_result["trades"]
-                if trades_df.empty:
-                    st.write("No completed trades in this window.")
-                else:
-                    st.dataframe(trades_df, use_container_width=True)
-
-            st.caption("This backtest is still simplified, but it is stronger than the earlier version: more structure-aware, more stats, still not execution-grade research.")
-
     with tab3:
-        st.subheader("Signal Alerts")
-        st.caption("Alerts are logged when the signal changes on refresh / rerun.")
-        alerts = st.session_state[history_key]
-        if alerts:
-            st.dataframe(pd.DataFrame(alerts), use_container_width=True)
-        else:
-            st.write("No signal changes logged yet.")
-
-    with tab4:
-        st.subheader("Raw Data")
-        st.dataframe(entry_df.tail(120), use_container_width=True)
+        st.write("Refresh or change timeframe to update the latest signal view.")
 
 except Exception as e:
     st.error(f"Error: {e}")
