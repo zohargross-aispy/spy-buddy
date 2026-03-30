@@ -4,19 +4,24 @@ from typing import Any, Dict, Optional
 import pandas as pd
 import requests
 import streamlit as st
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="SPY Buddy Options V1", page_icon="🎯", layout="wide")
-st.title("🎯 SPY Buddy Options V1")
-st.caption("Live P&L, better options states, contract quality filter, and news panel.")
+st.set_page_config(page_title="SPY Buddy Options V2", page_icon="🎯", layout="wide")
+st.title("🎯 SPY Buddy Options V2")
+st.caption("Position-aware options manager with live P&L, locked entry, TP/SL tracking, warnings, exits, and chart.")
 
 ALPACA_KEY = st.secrets.get("ALPACA_API_KEY", "")
 ALPACA_SECRET = st.secrets.get("ALPACA_SECRET_KEY", "")
 
 PAPER_BASE = "https://paper-api.alpaca.markets"
 DATA_BASE = "https://data.alpaca.markets"
+
 DEFAULT_SYMBOL = "SPY"
 
 
+# ----------------------------
+# HELPERS
+# ----------------------------
 def headers() -> Dict[str, str]:
     return {
         "APCA-API-KEY-ID": ALPACA_KEY,
@@ -69,6 +74,105 @@ def safe_get(d: dict, *path, default=None):
     return cur
 
 
+def state_color(state: str) -> str:
+    return {
+        "ENTER CALL": "green",
+        "ENTER PUT": "red",
+        "HOLD CALL": "blue",
+        "HOLD PUT": "blue",
+        "TP1 HIT": "violet",
+        "EXIT CALL": "orange",
+        "EXIT PUT": "orange",
+        "WEAKENING": "orange",
+        "NO TRADE": "gray",
+    }.get(state, "gray")
+
+
+def contract_quality(
+    underlying_price: Optional[float],
+    strike: Optional[float],
+    bid: Optional[float],
+    ask: Optional[float],
+    volume: Optional[float],
+    open_interest: Optional[float],
+    iv: Optional[float],
+    delta: Optional[float],
+) -> dict:
+    score = 100
+    reasons = []
+    spread = None
+    spread_pct = None
+
+    if bid is not None and ask is not None:
+        spread = float(ask) - float(bid)
+        if ask and ask > 0:
+            spread_pct = spread / float(ask)
+
+    if spread_pct is None:
+        score -= 25
+        reasons.append("No usable bid/ask spread.")
+    elif spread_pct > 0.20:
+        score -= 30
+        reasons.append("Spread too wide.")
+    elif spread_pct > 0.10:
+        score -= 15
+        reasons.append("Spread somewhat wide.")
+    else:
+        reasons.append("Spread acceptable.")
+
+    if ask is None:
+        score -= 15
+        reasons.append("No ask price.")
+    elif ask < 0.10:
+        score -= 20
+        reasons.append("Premium too tiny / noisy.")
+    elif ask > 10:
+        score -= 10
+        reasons.append("Premium is expensive.")
+    else:
+        reasons.append("Premium in a workable range.")
+
+    if underlying_price is not None and strike is not None and underlying_price > 0:
+        moneyness = abs(float(strike) - float(underlying_price)) / float(underlying_price)
+        if moneyness > 0.05:
+            score -= 20
+            reasons.append("Strike far from underlying.")
+        elif moneyness > 0.02:
+            score -= 8
+            reasons.append("Strike slightly far from underlying.")
+        else:
+            reasons.append("Strike near the underlying.")
+
+    if volume is not None:
+        if float(volume) < 10:
+            score -= 15
+            reasons.append("Low contract volume.")
+        else:
+            reasons.append("Volume acceptable.")
+
+    if open_interest is not None:
+        if float(open_interest) < 50:
+            score -= 15
+            reasons.append("Low open interest.")
+        else:
+            reasons.append("Open interest acceptable.")
+
+    if iv is not None and float(iv) > 2.0:
+        score -= 10
+        reasons.append("Implied volatility very high.")
+
+    if delta is None:
+        reasons.append("Greeks unavailable.")
+    else:
+        reasons.append("Delta available.")
+
+    score = max(0, min(100, score))
+    return {"score": score, "quality_ok": score >= 55, "spread": spread, "spread_pct": spread_pct, "reasons": reasons}
+
+
+# ----------------------------
+# DATA
+# ----------------------------
 @st.cache_data(ttl=20)
 def get_stock_snapshot(symbol: str) -> dict:
     return api_get(f"{DATA_BASE}/v2/stocks/{symbol}/snapshot")
@@ -220,97 +324,29 @@ def place_option_order(symbol: str, qty: int, side: str, order_type: str = "mark
     return api_post(f"{PAPER_BASE}/v2/orders", payload)
 
 
-def contract_quality(
-    underlying_price: Optional[float],
-    strike: Optional[float],
-    bid: Optional[float],
-    ask: Optional[float],
-    volume: Optional[float],
-    open_interest: Optional[float],
-    iv: Optional[float],
-    delta: Optional[float],
-) -> dict:
-    score = 100
-    reasons = []
-
-    spread = None
-    spread_pct = None
-
-    if bid is not None and ask is not None:
-        spread = float(ask) - float(bid)
-        if ask and ask > 0:
-            spread_pct = spread / float(ask)
-
-    if spread_pct is None:
-        score -= 25
-        reasons.append("No usable bid/ask spread.")
-    elif spread_pct > 0.20:
-        score -= 30
-        reasons.append("Spread too wide.")
-    elif spread_pct > 0.10:
-        score -= 15
-        reasons.append("Spread somewhat wide.")
-    else:
-        reasons.append("Spread acceptable.")
-
-    if ask is None:
-        score -= 15
-        reasons.append("No ask price.")
-    elif ask < 0.10:
-        score -= 20
-        reasons.append("Premium too tiny / noisy.")
-    elif ask > 10:
-        score -= 10
-        reasons.append("Premium is expensive.")
-    else:
-        reasons.append("Premium in a workable range.")
-
-    if underlying_price is not None and strike is not None and underlying_price > 0:
-        moneyness = abs(float(strike) - float(underlying_price)) / float(underlying_price)
-        if moneyness > 0.05:
-            score -= 20
-            reasons.append("Strike far from underlying.")
-        elif moneyness > 0.02:
-            score -= 8
-            reasons.append("Strike slightly far from underlying.")
-        else:
-            reasons.append("Strike near the underlying.")
-
-    if volume is not None:
-        if float(volume) < 10:
-            score -= 15
-            reasons.append("Low contract volume.")
-        else:
-            reasons.append("Volume acceptable.")
-
-    if open_interest is not None:
-        if float(open_interest) < 50:
-            score -= 15
-            reasons.append("Low open interest.")
-        else:
-            reasons.append("Open interest acceptable.")
-
-    if iv is not None and float(iv) > 2.0:
-        score -= 10
-        reasons.append("Implied volatility very high.")
-
-    if delta is None:
-        reasons.append("Greeks unavailable.")
-    else:
-        reasons.append("Delta available.")
-
-    score = max(0, min(100, score))
-    quality_ok = score >= 55
-
-    return {
-        "score": score,
-        "quality_ok": quality_ok,
-        "spread": spread,
-        "spread_pct": spread_pct,
-        "reasons": reasons,
-    }
+# ----------------------------
+# POSITION MEMORY
+# ----------------------------
+if "active_trade" not in st.session_state:
+    st.session_state.active_trade = None
 
 
+def save_active_trade(trade: dict):
+    st.session_state.active_trade = trade
+
+
+def clear_active_trade():
+    st.session_state.active_trade = None
+
+
+def active_trade_matches(contract_symbol: Optional[str]) -> bool:
+    t = st.session_state.active_trade
+    return bool(t and contract_symbol and t.get("contract_symbol") == contract_symbol)
+
+
+# ----------------------------
+# STATE ENGINE
+# ----------------------------
 def derive_options_state(stock_bias: str, option_side: str, has_position: bool, quality_ok: bool) -> str:
     side = option_side.upper()
 
@@ -323,7 +359,7 @@ def derive_options_state(stock_bias: str, option_side: str, has_position: bool, 
         if stock_bias == "BULLISH" and has_position:
             return "HOLD CALL"
         if stock_bias != "BULLISH" and has_position:
-            return "EXIT CALL"
+            return "WEAKENING"
         return "NO TRADE"
 
     if side == "PUT":
@@ -332,10 +368,46 @@ def derive_options_state(stock_bias: str, option_side: str, has_position: bool, 
         if stock_bias == "BEARISH" and has_position:
             return "HOLD PUT"
         if stock_bias != "BEARISH" and has_position:
-            return "EXIT PUT"
+            return "WEAKENING"
         return "NO TRADE"
 
     return "NO TRADE"
+
+
+def manage_active_trade(active_trade: Optional[dict], current_premium: Optional[float], stock_bias: str) -> dict:
+    if not active_trade:
+        return {"state": None, "notes": []}
+
+    notes = []
+    side = active_trade["option_side"].upper()
+    tp1_hit = False
+    hard_exit = False
+    state = f"HOLD {side}"
+
+    if current_premium is not None:
+        if current_premium <= active_trade["premium_stop"]:
+            hard_exit = True
+            notes.append("Premium stop hit.")
+        if current_premium >= active_trade["tp2"]:
+            hard_exit = True
+            notes.append("TP2 hit.")
+        if current_premium >= active_trade["tp1"]:
+            tp1_hit = True
+            notes.append("TP1 hit.")
+
+    if side == "CALL" and stock_bias != "BULLISH":
+        notes.append("Underlying bias weakened for calls.")
+    if side == "PUT" and stock_bias != "BEARISH":
+        notes.append("Underlying bias weakened for puts.")
+
+    if hard_exit:
+        state = f"EXIT {side}"
+    elif tp1_hit:
+        state = "TP1 HIT"
+    elif notes:
+        state = "WEAKENING"
+
+    return {"state": state, "notes": notes}
 
 
 if not ALPACA_KEY or not ALPACA_SECRET:
@@ -347,7 +419,7 @@ with st.sidebar:
     symbol = st.text_input("Underlying", value=DEFAULT_SYMBOL).upper().strip()
     option_side = st.selectbox("Direction", ["Call", "Put"])
     tf = st.selectbox("Underlying timeframe", ["1Min", "5Min", "15Min", "1Hour"], index=1)
-    qty = st.number_input("Contracts", min_value=1, max_value=100, value=1, step=1)
+    qty = st.number_input("Contracts", min_value=1, max_value=100, value=10, step=1)
     order_style = st.selectbox("Order type", ["market", "limit"])
 
 contracts_raw = get_option_contracts(symbol, None, option_side)
@@ -361,11 +433,9 @@ with colB:
     strikes = sorted({float(c.get("strike_price")) for c in contracts_for_exp if c.get("strike_price") is not None})
     strike = st.selectbox("Strike", strikes, index=0 if strikes else None)
 with colC:
-    refresh_clicked = st.button("Refresh data", use_container_width=True)
-
-if refresh_clicked:
-    st.cache_data.clear()
-    st.rerun()
+    if st.button("Refresh data", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
 
 selected_contract = None
 if expiration and strike is not None:
@@ -391,6 +461,8 @@ quote_mid = None
 if quote_bid is not None and quote_ask is not None:
     quote_mid = (float(quote_bid) + float(quote_ask)) / 2.0
 last_option_trade = safe_get(snapshot, "latestTrade", "p")
+current_premium = quote_mid if quote_mid is not None else last_option_trade
+
 delta = safe_get(snapshot, "greeks", "delta")
 gamma = safe_get(snapshot, "greeks", "gamma")
 theta = safe_get(snapshot, "greeks", "theta")
@@ -411,10 +483,16 @@ quality = contract_quality(
     delta=delta,
 )
 
-position = find_position(contract_symbol) if contract_symbol else None
-has_position = position is not None
-state = derive_options_state(stock_bias, option_side, has_position, quality["quality_ok"])
+broker_position = find_position(contract_symbol) if contract_symbol else None
+has_position = broker_position is not None or active_trade_matches(contract_symbol)
 
+base_state = derive_options_state(stock_bias, option_side, has_position, quality["quality_ok"])
+managed = manage_active_trade(st.session_state.active_trade if active_trade_matches(contract_symbol) else None, current_premium, stock_bias)
+state = managed["state"] or base_state
+
+# ----------------------------
+# TOP PANELS
+# ----------------------------
 st.subheader("Underlying")
 u1, u2, u3, u4 = st.columns(4)
 u1.metric("Bias", stock_bias)
@@ -459,7 +537,12 @@ s1.metric("State", state)
 s2.metric("Holding this contract?", "Yes" if has_position else "No")
 s3.metric("Direction", option_side)
 
+# ----------------------------
+# TRADE PLAN + MEMORY
+# ----------------------------
 default_entry = quote_ask if quote_ask is not None else (last_option_trade if last_option_trade is not None else 0.0)
+if active_trade_matches(contract_symbol):
+    default_entry = st.session_state.active_trade["entry_premium"]
 
 st.subheader("Trade Plan")
 p1, p2, p3, p4, p5 = st.columns(5)
@@ -494,26 +577,95 @@ r3.metric("TP2", fmt_money(tp2))
 r4.metric("R/R to TP1", "N/A" if rr1 is None else f"{rr1:.2f}")
 r5.metric("R/R to TP2", "N/A" if rr2 is None else f"{rr2:.2f}")
 
-if state in ["ENTER CALL", "ENTER PUT"] and rr1 is not None and rr1 < min_rr:
+if base_state in ["ENTER CALL", "ENTER PUT"] and rr1 is not None and rr1 < min_rr:
     st.warning("Direction is good, but reward/risk is below your minimum. No trade.")
 elif state == "NO TRADE":
     st.info("No trade right now.")
 elif state in ["HOLD CALL", "HOLD PUT"]:
     st.info(f"{state}. Manage the open position.")
+elif state == "TP1 HIT":
+    st.success("TP1 HIT. Consider taking partial profit and tightening your stop.")
 elif state in ["EXIT CALL", "EXIT PUT"]:
-    st.warning(f"{state}. Consider closing the open position.")
+    st.warning(f"{state}. Hard exit condition triggered.")
+elif state == "WEAKENING":
+    st.warning("WEAKENING. Soft warning only. Momentum or bias has weakened.")
 else:
     st.success(state)
 
-st.subheader("Live Position P&L")
-l1, l2, l3, l4, l5, l6 = st.columns(6)
-l1.metric("Position?", "Yes" if position else "No")
-l2.metric("Qty", position.get("qty") if position else "0")
-l3.metric("Avg Entry", fmt_money(position.get("avg_entry_price") if position else None))
-l4.metric("Market Value", fmt_money(position.get("market_value") if position else None))
-l5.metric("Unrealized P/L", fmt_money(position.get("unrealized_pl") if position else None))
-l6.metric("Unrealized P/L %", fmt_num(position.get("unrealized_plpc") * 100 if position and position.get("unrealized_plpc") is not None else None, 2))
+if managed["notes"]:
+    with st.expander("Trade manager notes"):
+        for n in managed["notes"]:
+            st.write(f"- {n}")
 
+# ----------------------------
+# LIVE P&L
+# ----------------------------
+st.subheader("Live Position P&L")
+pos = broker_position if broker_position else None
+if active_trade_matches(contract_symbol) and current_premium is not None:
+    custom_pl = (float(current_premium) - float(st.session_state.active_trade["entry_premium"])) * int(st.session_state.active_trade["qty"]) * 100
+    custom_pl_pct = ((float(current_premium) / float(st.session_state.active_trade["entry_premium"])) - 1.0) * 100
+else:
+    custom_pl = None
+    custom_pl_pct = None
+
+l1, l2, l3, l4, l5, l6 = st.columns(6)
+l1.metric("Position?", "Yes" if has_position else "No")
+l2.metric("Qty", str(st.session_state.active_trade["qty"]) if active_trade_matches(contract_symbol) else (pos.get("qty") if pos else "0"))
+l3.metric("Locked Entry", fmt_money(st.session_state.active_trade["entry_premium"]) if active_trade_matches(contract_symbol) else fmt_money(pos.get("avg_entry_price") if pos else None))
+l4.metric("Current Premium", fmt_money(current_premium))
+l5.metric("Custom P/L", fmt_money(custom_pl))
+l6.metric("Custom P/L %", fmt_num(custom_pl_pct, 2))
+
+# ----------------------------
+# ACTIONS
+# ----------------------------
+st.subheader("Actions")
+limit_seed = quote_ask if quote_ask is not None else entry_premium
+limit_price = st.number_input("Limit price (used only for limit orders)", min_value=0.0, value=float(limit_seed or 0.0), step=0.05)
+
+a1, a2, a3 = st.columns(3)
+
+can_start = contract_symbol is not None and entry_premium > 0 and premium_stop is not None and tp1 is not None and tp2 is not None
+if a1.button("Start / Lock Trade", use_container_width=True, disabled=not can_start):
+    save_active_trade({
+        "contract_symbol": contract_symbol,
+        "option_side": option_side.upper(),
+        "qty": int(qty),
+        "entry_premium": float(entry_premium),
+        "premium_stop": float(premium_stop),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+    })
+    st.success("Trade locked into the app memory.")
+
+if a2.button("Paper Buy to Open", use_container_width=True, disabled=contract_symbol is None):
+    try:
+        order = place_option_order(contract_symbol, int(qty), "buy", order_style, limit_price if order_style == "limit" else None)
+        st.success(f"Submitted buy order: {order.get('id', 'ok')}")
+    except Exception as e:
+        st.error(f"Buy order failed: {e}")
+
+if a3.button("Paper Sell to Close", use_container_width=True, disabled=contract_symbol is None):
+    try:
+        order = place_option_order(contract_symbol, int(qty), "sell", order_style, limit_price if order_style == "limit" else None)
+        st.success(f"Submitted sell order: {order.get('id', 'ok')}")
+        if active_trade_matches(contract_symbol):
+            clear_active_trade()
+    except Exception as e:
+        st.error(f"Sell order failed: {e}")
+
+c1, c2 = st.columns(2)
+if c1.button("Clear Locked Trade", use_container_width=True):
+    clear_active_trade()
+    st.info("Locked trade cleared.")
+if c2.button("Refresh data", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
+
+# ----------------------------
+# NEWS
+# ----------------------------
 st.subheader("Recent News")
 news = get_news(symbol, limit=8)
 if not news:
@@ -527,27 +679,33 @@ else:
         st.markdown(f"**{headline}**")
         st.caption(f"{source} • {ts}")
         if summary:
-            st.write(summary[:240] + ("..." if len(summary) > 240 else ""))
+            st.write(summary[:220] + ("..." if len(summary) > 220 else ""))
         st.markdown("---")
 
-st.subheader("Paper Actions")
-limit_seed = quote_ask if quote_ask is not None else entry_premium
-limit_price = st.number_input("Limit price (used only for limit orders)", min_value=0.0, value=float(limit_seed or 0.0), step=0.05)
-
-a1, a2 = st.columns(2)
-if a1.button("Paper Buy to Open", use_container_width=True, disabled=contract_symbol is None):
-    try:
-        order = place_option_order(contract_symbol, int(qty), "buy", order_style, limit_price if order_style == "limit" else None)
-        st.success(f"Submitted buy order: {order.get('id', 'ok')}")
-    except Exception as e:
-        st.error(f"Buy order failed: {e}")
-
-if a2.button("Paper Sell to Close", use_container_width=True, disabled=contract_symbol is None):
-    try:
-        order = place_option_order(contract_symbol, int(qty), "sell", order_style, limit_price if order_style == "limit" else None)
-        st.success(f"Submitted sell order: {order.get('id', 'ok')}")
-    except Exception as e:
-        st.error(f"Sell order failed: {e}")
+# ----------------------------
+# CHART
+# ----------------------------
+st.subheader("Underlying Chart")
+if not bars.empty:
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=bars["Time"],
+        open=bars["Open"],
+        high=bars["High"],
+        low=bars["Low"],
+        close=bars["Close"],
+        name=symbol
+    ))
+    for col in ["EMA_8", "EMA_21", "EMA_50"]:
+        fig.add_trace(go.Scatter(x=bars["Time"], y=bars[col], mode="lines", name=col))
+    fig.update_layout(
+        height=550,
+        xaxis_rangeslider_visible=False,
+        dragmode="pan",
+    )
+    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displaylogo": False})
+else:
+    st.info("No underlying chart data returned.")
 
 with st.expander("Contract details"):
     st.json(selected_contract or {})
@@ -555,4 +713,4 @@ with st.expander("Contract details"):
 with st.expander("Snapshot payload"):
     st.json(snapshot or {})
 
-st.caption("This version adds: live P&L, better trade states, contract quality filter, and news panel.")
+st.caption("This version adds: chart restored, locked entry memory, TP/SL tracking, soft warning vs hard exit, and live P&L.")
