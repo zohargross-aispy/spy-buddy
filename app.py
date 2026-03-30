@@ -2,13 +2,13 @@ import math
 from typing import Any, Dict, Optional
 
 import pandas as pd
+import plotly.graph_objects as go
 import requests
 import streamlit as st
-import plotly.graph_objects as go
 
 st.set_page_config(page_title="SPY Buddy Options V2", page_icon="🎯", layout="wide")
 st.title("🎯 SPY Buddy Options V2")
-st.caption("Position-aware options manager with live P&L, locked entry, TP/SL tracking, warnings, exits, and chart.")
+st.caption("Position-aware options manager with locked entry, TP/SL tracking, chart, live P&L, and news.")
 
 ALPACA_KEY = st.secrets.get("ALPACA_API_KEY", "")
 ALPACA_SECRET = st.secrets.get("ALPACA_SECRET_KEY", "")
@@ -20,7 +20,7 @@ DEFAULT_SYMBOL = "SPY"
 
 
 # ----------------------------
-# HELPERS
+# API HELPERS
 # ----------------------------
 def headers() -> Dict[str, str]:
     return {
@@ -47,6 +47,9 @@ def api_post(url: str, payload: dict) -> dict:
     return r.json()
 
 
+# ----------------------------
+# FORMATTERS
+# ----------------------------
 def fmt_money(x: Any) -> str:
     try:
         if x is None or (isinstance(x, float) and math.isnan(x)):
@@ -81,11 +84,188 @@ def state_color(state: str) -> str:
         "HOLD CALL": "blue",
         "HOLD PUT": "blue",
         "TP1 HIT": "violet",
+        "WEAKENING": "orange",
         "EXIT CALL": "orange",
         "EXIT PUT": "orange",
-        "WEAKENING": "orange",
         "NO TRADE": "gray",
     }.get(state, "gray")
+
+
+# ----------------------------
+# POSITION MEMORY
+# ----------------------------
+if "active_trade" not in st.session_state:
+    st.session_state.active_trade = None
+
+
+def save_active_trade(trade: dict):
+    st.session_state.active_trade = trade
+
+
+def clear_active_trade():
+    st.session_state.active_trade = None
+
+
+def active_trade_matches(contract_symbol: Optional[str]) -> bool:
+    t = st.session_state.active_trade
+    return bool(t and contract_symbol and t.get("contract_symbol") == contract_symbol)
+
+
+# ----------------------------
+# ALPACA DATA
+# ----------------------------
+@st.cache_data(ttl=20)
+def get_stock_snapshot(symbol: str) -> dict:
+    return api_get(f"{DATA_BASE}/v2/stocks/{symbol}/snapshot")
+
+
+@st.cache_data(ttl=30)
+def get_stock_bars(symbol: str, timeframe: str = "5Min", limit: int = 120) -> pd.DataFrame:
+    payload = api_get(
+        f"{DATA_BASE}/v2/stocks/bars",
+        params={
+            "symbols": symbol.upper(),
+            "timeframe": timeframe,
+            "limit": limit,
+            "adjustment": "raw",
+            "feed": "iex",
+            "sort": "asc",
+        },
+    )
+    bars = payload.get("bars", {}).get(symbol.upper(), [])
+    if not bars:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(bars)
+    df["Time"] = pd.to_datetime(df["t"], utc=True).dt.tz_convert("America/New_York")
+    df = df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
+    return df[["Time", "Open", "High", "Low", "Close", "Volume"]]
+
+
+@st.cache_data(ttl=60)
+def get_option_contracts(symbol: str, expiration_date: Optional[str], option_type: Optional[str]) -> list:
+    params = {
+        "underlying_symbols": symbol.upper(),
+        "status": "active",
+        "limit": 1000,
+    }
+    if expiration_date:
+        params["expiration_date"] = expiration_date
+    if option_type:
+        params["type"] = option_type.lower()
+    payload = api_get(f"{PAPER_BASE}/v2/options/contracts", params=params)
+    return payload.get("option_contracts", [])
+
+
+@st.cache_data(ttl=20)
+def get_option_snapshot(contract_symbol: str) -> dict:
+    payload = api_get(
+        f"{DATA_BASE}/v1beta1/options/snapshots",
+        params={"symbols": contract_symbol},
+    )
+    return payload.get("snapshots", {}).get(contract_symbol, {})
+
+
+@st.cache_data(ttl=30)
+def get_news(symbols: str, limit: int = 8) -> list:
+    payload = api_get(
+        f"{DATA_BASE}/v1beta1/news",
+        params={"symbols": symbols, "limit": limit, "sort": "desc"},
+    )
+    return payload.get("news", [])
+
+
+def get_open_positions() -> list:
+    try:
+        return api_get(f"{PAPER_BASE}/v2/positions")
+    except Exception:
+        return []
+
+
+def find_position(symbol: str) -> Optional[dict]:
+    for p in get_open_positions():
+        if p.get("symbol") == symbol:
+            return p
+    return None
+
+
+def place_option_order(symbol: str, qty: int, side: str, order_type: str = "market", limit_price: Optional[float] = None) -> dict:
+    payload: Dict[str, Any] = {
+        "symbol": symbol,
+        "qty": str(qty),
+        "side": side,
+        "type": order_type,
+        "time_in_force": "day",
+    }
+    if order_type == "limit" and limit_price is not None:
+        payload["limit_price"] = str(limit_price)
+    return api_post(f"{PAPER_BASE}/v2/orders", payload)
+
+
+# ----------------------------
+# SIGNALS / QUALITY
+# ----------------------------
+def add_underlying_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+
+    out["EMA_8"] = out["Close"].ewm(span=8, adjust=False).mean()
+    out["EMA_21"] = out["Close"].ewm(span=21, adjust=False).mean()
+    out["EMA_50"] = out["Close"].ewm(span=50, adjust=False).mean()
+
+    delta = out["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    out["RSI"] = 100 - (100 / (1 + rs))
+    return out
+
+
+def stock_signal(df: pd.DataFrame) -> tuple[str, int, list]:
+    if df.empty or len(df) < 30:
+        return "NO TRADE", 0, ["Not enough bar data."]
+
+    row = df.iloc[-1]
+    score = 0
+    reasons = []
+
+    if row["Close"] > row["EMA_8"]:
+        score += 1
+        reasons.append("Price above EMA 8.")
+    else:
+        score -= 1
+        reasons.append("Price below EMA 8.")
+
+    if row["EMA_8"] > row["EMA_21"]:
+        score += 1
+        reasons.append("EMA 8 above EMA 21.")
+    else:
+        score -= 1
+        reasons.append("EMA 8 below EMA 21.")
+
+    if row["EMA_21"] > row["EMA_50"]:
+        score += 1
+        reasons.append("EMA 21 above EMA 50.")
+    else:
+        score -= 1
+        reasons.append("EMA 21 below EMA 50.")
+
+    if pd.notna(row["RSI"]):
+        if row["RSI"] > 55:
+            score += 1
+            reasons.append("RSI supportive.")
+        elif row["RSI"] < 45:
+            score -= 1
+            reasons.append("RSI weak.")
+
+    if score >= 3:
+        return "BULLISH", score, reasons
+    if score <= -3:
+        return "BEARISH", score, reasons
+    return "NEUTRAL", score, reasons
 
 
 def contract_quality(
@@ -167,186 +347,15 @@ def contract_quality(
         reasons.append("Delta available.")
 
     score = max(0, min(100, score))
-    return {"score": score, "quality_ok": score >= 55, "spread": spread, "spread_pct": spread_pct, "reasons": reasons}
-
-
-# ----------------------------
-# DATA
-# ----------------------------
-@st.cache_data(ttl=20)
-def get_stock_snapshot(symbol: str) -> dict:
-    return api_get(f"{DATA_BASE}/v2/stocks/{symbol}/snapshot")
-
-
-@st.cache_data(ttl=30)
-def get_stock_bars(symbol: str, timeframe: str = "5Min", limit: int = 120) -> pd.DataFrame:
-    payload = api_get(
-        f"{DATA_BASE}/v2/stocks/bars",
-        params={
-            "symbols": symbol.upper(),
-            "timeframe": timeframe,
-            "limit": limit,
-            "adjustment": "raw",
-            "feed": "iex",
-            "sort": "asc",
-        },
-    )
-    bars = payload.get("bars", {}).get(symbol.upper(), [])
-    if not bars:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(bars)
-    df["Time"] = pd.to_datetime(df["t"], utc=True).dt.tz_convert("America/New_York")
-    df = df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
-    return df[["Time", "Open", "High", "Low", "Close", "Volume"]]
-
-
-def add_underlying_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if out.empty:
-        return out
-
-    out["EMA_8"] = out["Close"].ewm(span=8, adjust=False).mean()
-    out["EMA_21"] = out["Close"].ewm(span=21, adjust=False).mean()
-    out["EMA_50"] = out["Close"].ewm(span=50, adjust=False).mean()
-
-    delta = out["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
-    out["RSI"] = 100 - (100 / (1 + rs))
-    return out
-
-
-def stock_signal(df: pd.DataFrame) -> tuple[str, int, list]:
-    if df.empty or len(df) < 30:
-        return "NO TRADE", 0, ["Not enough bar data."]
-
-    row = df.iloc[-1]
-    score = 0
-    reasons = []
-
-    if row["Close"] > row["EMA_8"]:
-        score += 1
-        reasons.append("Price above EMA 8.")
-    else:
-        score -= 1
-        reasons.append("Price below EMA 8.")
-
-    if row["EMA_8"] > row["EMA_21"]:
-        score += 1
-        reasons.append("EMA 8 above EMA 21.")
-    else:
-        score -= 1
-        reasons.append("EMA 8 below EMA 21.")
-
-    if row["EMA_21"] > row["EMA_50"]:
-        score += 1
-        reasons.append("EMA 21 above EMA 50.")
-    else:
-        score -= 1
-        reasons.append("EMA 21 below EMA 50.")
-
-    if pd.notna(row["RSI"]):
-        if row["RSI"] > 55:
-            score += 1
-            reasons.append("RSI supportive.")
-        elif row["RSI"] < 45:
-            score -= 1
-            reasons.append("RSI weak.")
-
-    if score >= 3:
-        return "BULLISH", score, reasons
-    if score <= -3:
-        return "BEARISH", score, reasons
-    return "NEUTRAL", score, reasons
-
-
-@st.cache_data(ttl=60)
-def get_option_contracts(symbol: str, expiration_date: Optional[str], option_type: Optional[str]) -> list:
-    params = {
-        "underlying_symbols": symbol.upper(),
-        "status": "active",
-        "limit": 1000,
+    return {
+        "score": score,
+        "quality_ok": score >= 55,
+        "spread": spread,
+        "spread_pct": spread_pct,
+        "reasons": reasons,
     }
-    if expiration_date:
-        params["expiration_date"] = expiration_date
-    if option_type:
-        params["type"] = option_type.lower()
-    payload = api_get(f"{PAPER_BASE}/v2/options/contracts", params=params)
-    return payload.get("option_contracts", [])
 
 
-@st.cache_data(ttl=20)
-def get_option_snapshot(contract_symbol: str) -> dict:
-    payload = api_get(
-        f"{DATA_BASE}/v1beta1/options/snapshots",
-        params={"symbols": contract_symbol},
-    )
-    return payload.get("snapshots", {}).get(contract_symbol, {})
-
-
-@st.cache_data(ttl=30)
-def get_news(symbols: str, limit: int = 8) -> list:
-    payload = api_get(
-        f"{DATA_BASE}/v1beta1/news",
-        params={"symbols": symbols, "limit": limit, "sort": "desc"},
-    )
-    return payload.get("news", [])
-
-
-def get_open_positions() -> list:
-    try:
-        return api_get(f"{PAPER_BASE}/v2/positions")
-    except Exception:
-        return []
-
-
-def find_position(symbol: str) -> Optional[dict]:
-    for p in get_open_positions():
-        if p.get("symbol") == symbol:
-            return p
-    return None
-
-
-def place_option_order(symbol: str, qty: int, side: str, order_type: str = "market", limit_price: Optional[float] = None) -> dict:
-    payload: Dict[str, Any] = {
-        "symbol": symbol,
-        "qty": str(qty),
-        "side": side,
-        "type": order_type,
-        "time_in_force": "day",
-    }
-    if order_type == "limit" and limit_price is not None:
-        payload["limit_price"] = str(limit_price)
-    return api_post(f"{PAPER_BASE}/v2/orders", payload)
-
-
-# ----------------------------
-# POSITION MEMORY
-# ----------------------------
-if "active_trade" not in st.session_state:
-    st.session_state.active_trade = None
-
-
-def save_active_trade(trade: dict):
-    st.session_state.active_trade = trade
-
-
-def clear_active_trade():
-    st.session_state.active_trade = None
-
-
-def active_trade_matches(contract_symbol: Optional[str]) -> bool:
-    t = st.session_state.active_trade
-    return bool(t and contract_symbol and t.get("contract_symbol") == contract_symbol)
-
-
-# ----------------------------
-# STATE ENGINE
-# ----------------------------
 def derive_options_state(stock_bias: str, option_side: str, has_position: bool, quality_ok: bool) -> str:
     side = option_side.upper()
 
@@ -380,36 +389,44 @@ def manage_active_trade(active_trade: Optional[dict], current_premium: Optional[
 
     notes = []
     side = active_trade["option_side"].upper()
-    tp1_hit = False
-    hard_exit = False
     state = f"HOLD {side}"
+
+    stop_hit = False
+    tp1_hit = False
+    tp2_hit = False
+    weakening = False
 
     if current_premium is not None:
         if current_premium <= active_trade["premium_stop"]:
-            hard_exit = True
+            stop_hit = True
             notes.append("Premium stop hit.")
-        if current_premium >= active_trade["tp2"]:
-            hard_exit = True
+        elif current_premium >= active_trade["tp2"]:
+            tp2_hit = True
             notes.append("TP2 hit.")
-        if current_premium >= active_trade["tp1"]:
+        elif current_premium >= active_trade["tp1"]:
             tp1_hit = True
             notes.append("TP1 hit.")
 
     if side == "CALL" and stock_bias != "BULLISH":
+        weakening = True
         notes.append("Underlying bias weakened for calls.")
     if side == "PUT" and stock_bias != "BEARISH":
+        weakening = True
         notes.append("Underlying bias weakened for puts.")
 
-    if hard_exit:
+    if stop_hit or tp2_hit:
         state = f"EXIT {side}"
     elif tp1_hit:
         state = "TP1 HIT"
-    elif notes:
+    elif weakening:
         state = "WEAKENING"
 
     return {"state": state, "notes": notes}
 
 
+# ----------------------------
+# START
+# ----------------------------
 if not ALPACA_KEY or not ALPACA_SECRET:
     st.error("Add ALPACA_API_KEY and ALPACA_SECRET_KEY to Streamlit secrets first.")
     st.stop()
@@ -433,7 +450,7 @@ with colB:
     strikes = sorted({float(c.get("strike_price")) for c in contracts_for_exp if c.get("strike_price") is not None})
     strike = st.selectbox("Strike", strikes, index=0 if strikes else None)
 with colC:
-    if st.button("Refresh data", use_container_width=True):
+    if st.button("Refresh data", use_container_width=True, key="top_refresh_btn"):
         st.cache_data.clear()
         st.rerun()
 
@@ -487,11 +504,15 @@ broker_position = find_position(contract_symbol) if contract_symbol else None
 has_position = broker_position is not None or active_trade_matches(contract_symbol)
 
 base_state = derive_options_state(stock_bias, option_side, has_position, quality["quality_ok"])
-managed = manage_active_trade(st.session_state.active_trade if active_trade_matches(contract_symbol) else None, current_premium, stock_bias)
+managed = manage_active_trade(
+    st.session_state.active_trade if active_trade_matches(contract_symbol) else None,
+    current_premium,
+    stock_bias,
+)
 state = managed["state"] or base_state
 
 # ----------------------------
-# TOP PANELS
+# PANELS
 # ----------------------------
 st.subheader("Underlying")
 u1, u2, u3, u4 = st.columns(4)
@@ -540,35 +561,93 @@ s3.metric("Direction", option_side)
 # ----------------------------
 # TRADE PLAN + MEMORY
 # ----------------------------
-default_entry = quote_ask if quote_ask is not None else (last_option_trade if last_option_trade is not None else 0.0)
-if active_trade_matches(contract_symbol):
-    default_entry = st.session_state.active_trade["entry_premium"]
+active_trade = st.session_state.get("active_trade")
+is_same_locked_trade = bool(
+    active_trade
+    and contract_symbol
+    and active_trade.get("contract_symbol") == contract_symbol
+)
+
+if is_same_locked_trade:
+    locked_entry = float(active_trade["entry_premium"])
+    locked_stop = float(active_trade["premium_stop"])
+    locked_tp1 = float(active_trade["tp1"])
+    locked_tp2 = float(active_trade["tp2"])
+else:
+    locked_entry = None
+    locked_stop = None
+    locked_tp1 = None
+    locked_tp2 = None
+
+default_entry = locked_entry if locked_entry is not None else (
+    quote_ask if quote_ask is not None else (last_option_trade if last_option_trade is not None else 0.0)
+)
 
 st.subheader("Trade Plan")
 p1, p2, p3, p4, p5 = st.columns(5)
-with p1:
-    entry_premium = st.number_input("Entry premium", min_value=0.0, value=float(default_entry or 0.0), step=0.05)
-with p2:
-    stop_pct = st.slider("Stop %", 5, 50, 20, 1)
-with p3:
-    tp1_pct = st.slider("TP1 %", 10, 100, 30, 1)
-with p4:
-    tp2_pct = st.slider("TP2 %", 20, 200, 50, 1)
-with p5:
-    min_rr = st.slider("Min R/R", 1.0, 3.0, 1.5, 0.1)
 
-premium_stop = None
-tp1 = None
-tp2 = None
-rr1 = None
-rr2 = None
-if entry_premium > 0:
-    risk_amt = entry_premium * (stop_pct / 100.0)
-    premium_stop = max(0.01, entry_premium - risk_amt)
-    tp1 = entry_premium * (1 + tp1_pct / 100.0)
-    tp2 = entry_premium * (1 + tp2_pct / 100.0)
-    rr1 = (tp1 - entry_premium) / max(0.0001, entry_premium - premium_stop)
-    rr2 = (tp2 - entry_premium) / max(0.0001, entry_premium - premium_stop)
+with p1:
+    entry_premium = st.number_input(
+        "Entry premium",
+        min_value=0.0,
+        value=float(default_entry or 0.0),
+        step=0.05,
+        key="entry_premium_input",
+        disabled=is_same_locked_trade
+    )
+
+with p2:
+    stop_pct = st.slider(
+        "Stop %",
+        5, 50, 20, 1,
+        key="stop_pct_input",
+        disabled=is_same_locked_trade
+    )
+
+with p3:
+    tp1_pct = st.slider(
+        "TP1 %",
+        10, 100, 30, 1,
+        key="tp1_pct_input",
+        disabled=is_same_locked_trade
+    )
+
+with p4:
+    tp2_pct = st.slider(
+        "TP2 %",
+        20, 200, 50, 1,
+        key="tp2_pct_input",
+        disabled=is_same_locked_trade
+    )
+
+with p5:
+    min_rr = st.slider(
+        "Min R/R",
+        1.0, 3.0, 1.5, 0.1,
+        key="min_rr_input",
+        disabled=is_same_locked_trade
+    )
+
+if is_same_locked_trade:
+    premium_stop = locked_stop
+    tp1 = locked_tp1
+    tp2 = locked_tp2
+    rr1 = ((tp1 - locked_entry) / max(0.0001, locked_entry - premium_stop)) if locked_entry > premium_stop else None
+    rr2 = ((tp2 - locked_entry) / max(0.0001, locked_entry - premium_stop)) if locked_entry > premium_stop else None
+else:
+    premium_stop = None
+    tp1 = None
+    tp2 = None
+    rr1 = None
+    rr2 = None
+
+    if entry_premium > 0:
+        risk_amt = entry_premium * (stop_pct / 100.0)
+        premium_stop = max(0.01, entry_premium - risk_amt)
+        tp1 = entry_premium * (1 + tp1_pct / 100.0)
+        tp2 = entry_premium * (1 + tp2_pct / 100.0)
+        rr1 = (tp1 - entry_premium) / max(0.0001, entry_premium - premium_stop)
+        rr2 = (tp2 - entry_premium) / max(0.0001, entry_premium - premium_stop)
 
 r1, r2, r3, r4, r5 = st.columns(5)
 r1.metric("Premium Stop", fmt_money(premium_stop))
@@ -576,6 +655,9 @@ r2.metric("TP1", fmt_money(tp1))
 r3.metric("TP2", fmt_money(tp2))
 r4.metric("R/R to TP1", "N/A" if rr1 is None else f"{rr1:.2f}")
 r5.metric("R/R to TP2", "N/A" if rr2 is None else f"{rr2:.2f}")
+
+if is_same_locked_trade:
+    st.success("Locked trade active. Trade Plan is frozen until cleared or closed.")
 
 if base_state in ["ENTER CALL", "ENTER PUT"] and rr1 is not None and rr1 < min_rr:
     st.warning("Direction is good, but reward/risk is below your minimum. No trade.")
@@ -602,7 +684,7 @@ if managed["notes"]:
 # ----------------------------
 st.subheader("Live Position P&L")
 pos = broker_position if broker_position else None
-if active_trade_matches(contract_symbol) and current_premium is not None:
+if is_same_locked_trade and current_premium is not None:
     custom_pl = (float(current_premium) - float(st.session_state.active_trade["entry_premium"])) * int(st.session_state.active_trade["qty"]) * 100
     custom_pl_pct = ((float(current_premium) / float(st.session_state.active_trade["entry_premium"])) - 1.0) * 100
 else:
@@ -611,8 +693,8 @@ else:
 
 l1, l2, l3, l4, l5, l6 = st.columns(6)
 l1.metric("Position?", "Yes" if has_position else "No")
-l2.metric("Qty", str(st.session_state.active_trade["qty"]) if active_trade_matches(contract_symbol) else (pos.get("qty") if pos else "0"))
-l3.metric("Locked Entry", fmt_money(st.session_state.active_trade["entry_premium"]) if active_trade_matches(contract_symbol) else fmt_money(pos.get("avg_entry_price") if pos else None))
+l2.metric("Qty", str(st.session_state.active_trade["qty"]) if is_same_locked_trade else (pos.get("qty") if pos else "0"))
+l3.metric("Locked Entry", fmt_money(st.session_state.active_trade["entry_premium"]) if is_same_locked_trade else fmt_money(pos.get("avg_entry_price") if pos else None))
 l4.metric("Current Premium", fmt_money(current_premium))
 l5.metric("Custom P/L", fmt_money(custom_pl))
 l6.metric("Custom P/L %", fmt_num(custom_pl_pct, 2))
@@ -622,12 +704,19 @@ l6.metric("Custom P/L %", fmt_num(custom_pl_pct, 2))
 # ----------------------------
 st.subheader("Actions")
 limit_seed = quote_ask if quote_ask is not None else entry_premium
-limit_price = st.number_input("Limit price (used only for limit orders)", min_value=0.0, value=float(limit_seed or 0.0), step=0.05)
+limit_price = st.number_input("Limit price (used only for limit orders)", min_value=0.0, value=float(limit_seed or 0.0), step=0.05, key="limit_price_input")
 
 a1, a2, a3 = st.columns(3)
 
-can_start = contract_symbol is not None and entry_premium > 0 and premium_stop is not None and tp1 is not None and tp2 is not None
-if a1.button("Start / Lock Trade", use_container_width=True, disabled=not can_start):
+can_start = (
+    contract_symbol is not None
+    and entry_premium > 0
+    and premium_stop is not None
+    and tp1 is not None
+    and tp2 is not None
+)
+
+if a1.button("Start / Lock Trade", use_container_width=True, disabled=not can_start, key="lock_trade_btn"):
     save_active_trade({
         "contract_symbol": contract_symbol,
         "option_side": option_side.upper(),
@@ -637,16 +726,16 @@ if a1.button("Start / Lock Trade", use_container_width=True, disabled=not can_st
         "tp1": float(tp1),
         "tp2": float(tp2),
     })
-    st.success("Trade locked into the app memory.")
+    st.success("Trade locked. Entry, stop, and targets will now stay fixed.")
 
-if a2.button("Paper Buy to Open", use_container_width=True, disabled=contract_symbol is None):
+if a2.button("Paper Buy to Open", use_container_width=True, disabled=contract_symbol is None, key="buy_open_btn"):
     try:
         order = place_option_order(contract_symbol, int(qty), "buy", order_style, limit_price if order_style == "limit" else None)
         st.success(f"Submitted buy order: {order.get('id', 'ok')}")
     except Exception as e:
         st.error(f"Buy order failed: {e}")
 
-if a3.button("Paper Sell to Close", use_container_width=True, disabled=contract_symbol is None):
+if a3.button("Paper Sell to Close", use_container_width=True, disabled=contract_symbol is None, key="sell_close_btn"):
     try:
         order = place_option_order(contract_symbol, int(qty), "sell", order_style, limit_price if order_style == "limit" else None)
         st.success(f"Submitted sell order: {order.get('id', 'ok')}")
@@ -656,10 +745,10 @@ if a3.button("Paper Sell to Close", use_container_width=True, disabled=contract_
         st.error(f"Sell order failed: {e}")
 
 c1, c2 = st.columns(2)
-if c1.button("Clear Locked Trade", use_container_width=True):
+if c1.button("Clear Locked Trade", use_container_width=True, key="clear_trade_btn"):
     clear_active_trade()
     st.info("Locked trade cleared.")
-if c2.button("Refresh data", use_container_width=True):
+if c2.button("Refresh data", use_container_width=True, key="bottom_refresh_btn"):
     st.cache_data.clear()
     st.rerun()
 
@@ -698,11 +787,7 @@ if not bars.empty:
     ))
     for col in ["EMA_8", "EMA_21", "EMA_50"]:
         fig.add_trace(go.Scatter(x=bars["Time"], y=bars[col], mode="lines", name=col))
-    fig.update_layout(
-        height=550,
-        xaxis_rangeslider_visible=False,
-        dragmode="pan",
-    )
+    fig.update_layout(height=550, xaxis_rangeslider_visible=False, dragmode="pan")
     st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displaylogo": False})
 else:
     st.info("No underlying chart data returned.")
