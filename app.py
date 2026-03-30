@@ -1,7 +1,7 @@
 import json
 import urllib.request
 import urllib.error
-from typing import Tuple, Optional
+from typing import Tuple
 
 import streamlit as st
 import yfinance as yf
@@ -71,6 +71,12 @@ def fmt_price(x):
     if x is None or pd.isna(x):
         return "N/A"
     return f"${float(x):,.2f}"
+
+
+def fmt_pct(x):
+    if x is None or pd.isna(x):
+        return "N/A"
+    return f"{float(x):.2f}%"
 
 
 def signal_color(signal: str) -> str:
@@ -167,7 +173,10 @@ def add_indicators(df: pd.DataFrame, timeframe_label: str) -> pd.DataFrame:
         session_dates = _normalized_dates(df.index).values
         typical_price = (df["High"] + df["Low"] + df["Close"]) / 3.0
         tpv = typical_price * df["Volume"]
-        df["VWAP"] = pd.Series(tpv).groupby(session_dates).cumsum().values / pd.Series(df["Volume"]).groupby(session_dates).cumsum().replace(0, np.nan).values
+        df["VWAP"] = (
+            pd.Series(tpv).groupby(session_dates).cumsum().values
+            / pd.Series(df["Volume"]).groupby(session_dates).cumsum().replace(0, np.nan).values
+        )
     else:
         df["VWAP"] = np.nan
 
@@ -549,201 +558,63 @@ def current_signal(entry_df: pd.DataFrame, hourly_df: pd.DataFrame, daily_df: pd
     }
 
 
-def vector_signal_score(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out["score"] = 0
+def build_options_plan(
+    signal: str,
+    premium_entry: float,
+    stop_pct: float,
+    tp1_pct: float,
+    tp2_pct: float,
+    min_rr: float,
+) -> dict:
+    if premium_entry <= 0:
+        return {
+            "enabled": False,
+            "status": "No option premium entered.",
+            "premium_stop": None,
+            "premium_tp1": None,
+            "premium_tp2": None,
+            "rr1": None,
+            "rr2": None,
+            "trade_ok": None,
+        }
 
-    out["score"] += np.where(out["Close"] > out["EMA_21"], 1, -1)
-    out["score"] += np.where(out["EMA_21"] > out["EMA_50"], 1, -1)
-    out["score"] += np.where(out["EMA_50"] > out["EMA_200"], 1, -1)
+    if signal not in ["BUY", "SELL"]:
+        return {
+            "enabled": True,
+            "status": "Options plan only activates on BUY or SELL.",
+            "premium_stop": None,
+            "premium_tp1": None,
+            "premium_tp2": None,
+            "rr1": None,
+            "rr2": None,
+            "trade_ok": False,
+        }
 
-    out["score"] += np.where((out["RSI"] >= 52) & (out["RSI"] <= 68), 1, 0)
-    out["score"] += np.where(out["RSI"] < 45, -1, 0)
-    out["score"] += np.where(out["RSI"] > 72, -1, 0)
+    risk_amt = premium_entry * (stop_pct / 100.0)
+    premium_stop = max(0.01, premium_entry - risk_amt)
+    premium_tp1 = premium_entry * (1 + tp1_pct / 100.0)
+    premium_tp2 = premium_entry * (1 + tp2_pct / 100.0)
 
-    out["score"] += np.where(out["MACD_HIST"] > 0, 1, -1)
-    out["score"] += np.where(out["Volume"] > out["VOL_AVG_20"], 1, 0)
+    rr1 = (premium_tp1 - premium_entry) / max(0.0001, premium_entry - premium_stop)
+    rr2 = (premium_tp2 - premium_entry) / max(0.0001, premium_entry - premium_stop)
 
-    if "VIX_CLOSE" in out.columns:
-        out["score"] += np.where(out["VIX_CLOSE"] < 18, 1, 0)
-        out["score"] += np.where(out["VIX_CLOSE"] > 24, -2, 0)
+    trade_ok = rr1 >= min_rr
 
-    if "VWAP" in out.columns:
-        out["score"] += np.where(pd.notna(out["VWAP"]) & (out["Close"] > out["VWAP"]), 1, 0)
-        out["score"] += np.where(pd.notna(out["VWAP"]) & (out["Close"] < out["VWAP"]), -1, 0)
-
-    if "PREV_DAY_HIGH" in out.columns:
-        out["score"] += np.where(pd.notna(out["PREV_DAY_HIGH"]) & (out["Close"] > out["PREV_DAY_HIGH"]), 1, 0)
-    if "PREV_DAY_LOW" in out.columns:
-        out["score"] += np.where(pd.notna(out["PREV_DAY_LOW"]) & (out["Close"] < out["PREV_DAY_LOW"]), -1, 0)
-
-    if "OPENING_RANGE_HIGH" in out.columns:
-        out["score"] += np.where(pd.notna(out["OPENING_RANGE_HIGH"]) & (out["Close"] > out["OPENING_RANGE_HIGH"]), 1, 0)
-    if "OPENING_RANGE_LOW" in out.columns:
-        out["score"] += np.where(pd.notna(out["OPENING_RANGE_LOW"]) & (out["Close"] < out["OPENING_RANGE_LOW"]), -1, 0)
-
-    atr_dist = abs(out["Close"] - out["EMA_21"]) / out["ATR"].replace(0, np.nan)
-    out["extended"] = atr_dist > 1.8
-    out["score"] += np.where(out["extended"], -1, 0)
-
-    out["signal_label"] = np.select(
-        [
-            out["score"] >= 8,
-            out["score"] <= -5,
-            (out["score"] >= 3) & (out["score"] <= 7),
-        ],
-        [
-            "BUY",
-            "SELL",
-            "HOLD",
-        ],
-        default="NO TRADE"
-    )
-
-    return out
-
-
-def find_chart_signals(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    marked = vector_signal_score(df.copy())
-    marked["prev_signal"] = marked["signal_label"].shift(1)
-
-    marked["fresh_buy"] = (marked["signal_label"] == "BUY") & (marked["prev_signal"] != "BUY")
-    marked["fresh_sell"] = (marked["signal_label"] == "SELL") & (marked["prev_signal"] != "SELL")
-
-    buy_rows = []
-    sell_rows = []
-    open_trade = None
-
-    for idx, row in marked.iterrows():
-        if row["fresh_buy"]:
-            buy_label = f"BUY<br>{float(row['Close']):.2f}"
-            buy_rows.append({
-                "index": idx,
-                "Low": row["Low"],
-                "High": row["High"],
-                "ATR": row["ATR"],
-                "Close": row["Close"],
-                "label": buy_label,
-            })
-            open_trade = {
-                "index": idx,
-                "price": float(row["Close"]),
-            }
-
-        elif row["fresh_sell"]:
-            sell_label = f"SELL<br>{float(row['Close']):.2f}"
-
-            if open_trade is not None:
-                pnl_pct = ((float(row["Close"]) / open_trade["price"]) - 1.0) * 100.0
-                sell_label = f"SELL<br>{float(row['Close']):.2f}<br>{pnl_pct:+.2f}%"
-                open_trade = None
-
-            sell_rows.append({
-                "index": idx,
-                "Low": row["Low"],
-                "High": row["High"],
-                "ATR": row["ATR"],
-                "Close": row["Close"],
-                "label": sell_label,
-            })
-
-    buy_points = pd.DataFrame(buy_rows)
-    sell_points = pd.DataFrame(sell_rows)
-
-    return buy_points, sell_points
-
-
-def run_backtest(df: pd.DataFrame, timeframe_label: str):
-    bt = df.copy()
-    bt = vector_signal_score(bt)
-    bt = bt.dropna(subset=["EMA_21", "EMA_50", "EMA_200", "RSI", "MACD_HIST", "ATR"]).copy()
-
-    if bt.empty or len(bt) < 80:
-        return None, None
-
-    position = []
-    in_pos = 0
-
-    for _, row in bt.iterrows():
-        enter_long = row["score"] >= 8 and not row["extended"]
-        hold_long = row["score"] >= 3 and row["Close"] > row["EMA_50"]
-        exit_long = row["score"] <= 1 or row["Close"] < row["EMA_21"]
-
-        if in_pos == 0 and enter_long:
-            in_pos = 1
-        elif in_pos == 1 and exit_long and not hold_long:
-            in_pos = 0
-
-        position.append(in_pos)
-
-    bt["position"] = position
-    bt["ret"] = bt["Close"].pct_change().fillna(0)
-    bt["strategy_ret"] = bt["ret"] * bt["position"].shift(1).fillna(0)
-    bt["equity_curve"] = (1 + bt["strategy_ret"]).cumprod()
-    bt["buy_hold_curve"] = (1 + bt["ret"]).cumprod()
-
-    bt["equity_peak"] = bt["equity_curve"].cummax()
-    bt["drawdown"] = bt["equity_curve"] / bt["equity_peak"] - 1
-
-    bt["position_change"] = bt["position"].diff().fillna(0)
-    entries = bt.index[bt["position_change"] == 1].tolist()
-    exits = bt.index[bt["position_change"] == -1].tolist()
-
-    if len(exits) < len(entries):
-        exits.append(bt.index[-1])
-
-    trades = []
-    for entry_time, exit_time in zip(entries, exits):
-        entry_price = bt.loc[entry_time, "Close"]
-        exit_price = bt.loc[exit_time, "Close"]
-        trade_return = (exit_price / entry_price) - 1
-        trades.append({
-            "Entry Time": entry_time,
-            "Exit Time": exit_time,
-            "Entry Price": round(float(entry_price), 2),
-            "Exit Price": round(float(exit_price), 2),
-            "Return %": round(trade_return * 100, 2),
-        })
-
-    trades_df = pd.DataFrame(trades)
-
-    total_return = (bt["equity_curve"].iloc[-1] - 1) * 100
-    buy_hold_return = (bt["buy_hold_curve"].iloc[-1] - 1) * 100
-    max_drawdown = bt["drawdown"].min() * 100
-    total_trades = len(trades_df)
-
-    if total_trades > 0:
-        win_rate = (trades_df["Return %"] > 0).mean() * 100
-        avg_trade = trades_df["Return %"].mean()
-        gross_profit = trades_df.loc[trades_df["Return %"] > 0, "Return %"].sum()
-        gross_loss = abs(trades_df.loc[trades_df["Return %"] < 0, "Return %"].sum())
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.nan
+    if trade_ok:
+        status = "Options setup passes minimum reward/risk."
     else:
-        win_rate = 0.0
-        avg_trade = 0.0
-        profit_factor = np.nan
+        status = "NO TRADE for options. Reward/risk is below your minimum."
 
-    exposure = bt["position"].mean() * 100
-
-    bars_year = TF_MAP[timeframe_label]["bars_year"]
-    sharpe = np.nan
-    std = bt["strategy_ret"].std()
-    if pd.notna(std) and std > 0:
-        sharpe = (bt["strategy_ret"].mean() / std) * np.sqrt(bars_year)
-
-    stats = {
-        "Strategy Return %": round(total_return, 2),
-        "Buy & Hold %": round(buy_hold_return, 2),
-        "Max Drawdown %": round(max_drawdown, 2),
-        "Trades": int(total_trades),
-        "Win Rate %": round(win_rate, 2),
-        "Avg Trade %": round(avg_trade, 2),
-        "Profit Factor": None if pd.isna(profit_factor) else round(float(profit_factor), 2),
-        "Exposure %": round(float(exposure), 2),
-        "Sharpe": None if pd.isna(sharpe) else round(float(sharpe), 2),
+    return {
+        "enabled": True,
+        "status": status,
+        "premium_stop": premium_stop,
+        "premium_tp1": premium_tp1,
+        "premium_tp2": premium_tp2,
+        "rr1": rr1,
+        "rr2": rr2,
+        "trade_ok": trade_ok,
     }
-
-    return bt, {"stats": stats, "trades": trades_df}
 
 
 def make_candlestick_chart(df: pd.DataFrame, symbol: str, timeframe_label: str):
@@ -991,6 +862,15 @@ with st.sidebar:
     timeframe = st.selectbox("Chart Timeframe", list(TF_MAP.keys()), index=0)
 
     st.divider()
+    st.subheader("Options Mode")
+    options_mode = st.checkbox("Use daily options mode", value=True)
+    premium_entry = st.number_input("Option entry premium ($)", min_value=0.0, value=0.0, step=0.05)
+    stop_loss_pct = st.slider("Premium stop loss %", min_value=10, max_value=40, value=20, step=1)
+    take_profit_1_pct = st.slider("Premium take profit 1 %", min_value=15, max_value=80, value=35, step=1)
+    take_profit_2_pct = st.slider("Premium take profit 2 %", min_value=25, max_value=150, value=60, step=1)
+    min_rr = st.slider("Minimum reward/risk", min_value=1.0, max_value=3.0, value=1.5, step=0.1)
+
+    st.divider()
     st.subheader("Backtest")
     backtest_bars = st.slider("Bars to backtest", min_value=120, max_value=2000, value=500, step=20)
 
@@ -1051,6 +931,28 @@ try:
 
     sig = current_signal(entry_df, hourly_df, daily_df, vix_value)
 
+    options_plan = build_options_plan(
+        signal=sig["signal"],
+        premium_entry=float(premium_entry),
+        stop_pct=float(stop_loss_pct),
+        tp1_pct=float(take_profit_1_pct),
+        tp2_pct=float(take_profit_2_pct),
+        min_rr=float(min_rr),
+    ) if options_mode else {
+        "enabled": False,
+        "status": "Options mode is off.",
+        "premium_stop": None,
+        "premium_tp1": None,
+        "premium_tp2": None,
+        "rr1": None,
+        "rr2": None,
+        "trade_ok": None,
+    }
+
+    display_signal = sig["signal"]
+    if options_mode and options_plan["enabled"] and options_plan["trade_ok"] is False:
+        display_signal = "NO TRADE"
+
     # Alerts
     alert_key = f"last_signal_{symbol}_{timeframe}"
     history_key = f"alert_history_{symbol}_{timeframe}"
@@ -1061,15 +963,15 @@ try:
     prev_signal = st.session_state.get(alert_key)
 
     if prev_signal is None:
-        st.session_state[alert_key] = sig["signal"]
+        st.session_state[alert_key] = display_signal
 
-    elif prev_signal != sig["signal"]:
+    elif prev_signal != display_signal:
         event_time = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
 
         alert_row = {
             "Time": event_time,
             "Old Signal": prev_signal,
-            "New Signal": sig["signal"],
+            "New Signal": display_signal,
             "Price": curr_price,
             "Ticker": symbol,
             "Timeframe": timeframe,
@@ -1078,19 +980,19 @@ try:
         }
 
         st.session_state[history_key].insert(0, alert_row)
-        st.session_state[alert_key] = sig["signal"]
+        st.session_state[alert_key] = display_signal
 
-        st.warning(f"Signal changed: {prev_signal} → {sig['signal']} at {fmt_price(curr_price)}")
+        st.warning(f"Signal changed: {prev_signal} → {display_signal} at {fmt_price(curr_price)}")
 
         toast_icon = {
             "BUY": "🟢",
             "HOLD": "🔵",
             "SELL": "🔴",
             "NO TRADE": "🟠"
-        }.get(sig["signal"], "📈")
+        }.get(display_signal, "📈")
 
         st.toast(
-            f"{symbol} {timeframe}: {prev_signal} → {sig['signal']} at {fmt_price(curr_price)}",
+            f"{symbol} {timeframe}: {prev_signal} → {display_signal} at {fmt_price(curr_price)}",
             icon=toast_icon
         )
 
@@ -1098,7 +1000,7 @@ try:
             payload = {
                 "text": (
                     f"{symbol} {timeframe} signal changed: "
-                    f"{prev_signal} -> {sig['signal']} | "
+                    f"{prev_signal} -> {display_signal} | "
                     f"Price: {curr_price} | "
                     f"Confidence: {sig['confidence']}% | "
                     f"Risk: {sig['risk']} | "
@@ -1114,7 +1016,7 @@ try:
                 st.toast(f"Webhook failed: {msg}", icon="❌")
 
     # Header
-    st.subheader(f"Signal: :{signal_color(sig['signal'])}[{sig['signal']}]")
+    st.subheader(f"Signal: :{signal_color(display_signal)}[{display_signal}]")
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Price", fmt_price(curr_price), None if change is None else f"{change:+.2f}")
@@ -1133,8 +1035,29 @@ try:
     d6.metric("OR High", fmt_price(safe_round(last.get("OPENING_RANGE_HIGH", np.nan), 2)))
 
     e1, e2 = st.columns(2)
-    e1.metric("Stop", fmt_price(safe_round(sig["stop"], 2)))
-    e2.metric("Target", fmt_price(safe_round(sig["target"], 2)))
+    e1.metric("Underlying Stop", fmt_price(safe_round(sig["stop"], 2)))
+    e2.metric("Underlying Target", fmt_price(safe_round(sig["target"], 2)))
+
+    if options_mode:
+        st.subheader("🎯 Daily Options Plan")
+        o1, o2, o3, o4, o5 = st.columns(5)
+        o1.metric("Entry Premium", fmt_price(premium_entry) if premium_entry > 0 else "N/A")
+        o2.metric("Premium Stop", fmt_price(options_plan["premium_stop"]))
+        o3.metric("TP1", fmt_price(options_plan["premium_tp1"]))
+        o4.metric("TP2", fmt_price(options_plan["premium_tp2"]))
+        o5.metric("R/R to TP1", "N/A" if options_plan["rr1"] is None else f"{options_plan['rr1']:.2f}")
+
+        p1, p2 = st.columns(2)
+        p1.metric("R/R to TP2", "N/A" if options_plan["rr2"] is None else f"{options_plan['rr2']:.2f}")
+        p2.metric("Options Verdict", "OK" if options_plan["trade_ok"] else ("WAIT" if options_plan["trade_ok"] is False else "N/A"))
+
+        if options_plan["enabled"]:
+            if options_plan["trade_ok"] is False:
+                st.warning(options_plan["status"])
+            elif options_plan["trade_ok"] is True:
+                st.success(options_plan["status"])
+            else:
+                st.info(options_plan["status"])
 
     tab1, tab2, tab3, tab4 = st.tabs(["Dashboard", "Backtest", "Alerts", "Raw Data"])
 
@@ -1164,6 +1087,7 @@ try:
 - Price is too stretched
 - Volatility is hostile
 - Structure is messy
+- or your options reward/risk is below your minimum
                 """
             )
 
@@ -1246,7 +1170,7 @@ Data:
 Ticker: {symbol}
 Timeframe: {timeframe}
 Price: {curr_price}
-Signal: {sig['signal']}
+Signal: {display_signal}
 Confidence: {sig['confidence']}%
 Score: {sig['score']}
 Risk: {sig['risk']}
@@ -1266,8 +1190,12 @@ MACD: {safe_round(last['MACD'], 3)}
 MACD Signal: {safe_round(last['MACD_SIGNAL'], 3)}
 MACD Histogram: {safe_round(last['MACD_HIST'], 3)}
 VIX: {vix_value}
-Suggested stop: {safe_round(sig['stop'], 2)}
-Suggested target: {safe_round(sig['target'], 2)}
+Underlying stop: {safe_round(sig['stop'], 2)}
+Underlying target: {safe_round(sig['target'], 2)}
+Option premium entry: {premium_entry if premium_entry > 0 else 'N/A'}
+Option premium stop: {safe_round(options_plan['premium_stop'], 2)}
+Option premium TP1: {safe_round(options_plan['premium_tp1'], 2)}
+Option premium TP2: {safe_round(options_plan['premium_tp2'], 2)}
 """
 
                     with st.spinner("Running AI analysis..."):
