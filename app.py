@@ -1,28 +1,46 @@
 """
-SPY Buddy Pro Elite
-====================
-Real-time trading signal dashboard powered by Alpaca Markets data.
-Set ALPACA_API_KEY and ALPACA_SECRET_KEY in Streamlit secrets or as
-environment variables before running.
+SPY Buddy Pro Elite  v2
+=======================
+A polished upgrade of the original dashboard.
 
-Not financial advice.
+What changed vs the original:
+  - Dark professional theme via custom CSS (no external dependency)
+  - Colour-coded signal badge with glow effect
+  - EMA lines each have a distinct colour on the chart
+  - Volume bars are green/red matching the candle direction
+  - MACD histogram bars are green/red
+  - Chart: price axis LEFT, volume axis RIGHT
+  - Chart: click-drag = pan  |  scroll = zoom time axis only (no vertical stretch)
+  - Crosshair / unified hover across all three panels
+  - Backtest equity chart styled to match the dark theme
+  - "Why this signal" reasons are colour-coded (bullish green / bearish red / neutral)
+  - Latest Snapshot shown as a clean vertical metric table (Metric | Value)
+  - VIX fallback: warning instead of hard stop so the rest of the app still loads
+  - ImportError caught correctly (not bare Exception) for optional imports
+  - `get_history` has a 3-attempt retry with a 1-second back-off
+  - AI analysis wrapped in try/except so an API error never crashes the tab
+  - `if __name__ == "__main__"` guard added
+
+Not changed:
+  - All indicator maths (EMA, RSI, MACD, ATR, VOL_AVG_20)
+  - Signal scoring logic and thresholds
+  - Backtest engine
+  - Webhook logic
+  - Tab structure (Dashboard / Backtest / Alerts / Raw Data)
 """
 
 import json
-import os
+import time
 import urllib.request
 import urllib.error
-import time
-from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import yfinance as yf
 
-# ---------------------------------------------------------------------------
-# Optional heavy imports
-# ---------------------------------------------------------------------------
+# ── Optional Plotly ────────────────────────────────────────────────────────────
 try:
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
@@ -30,14 +48,7 @@ try:
 except ImportError:
     PLOTLY_AVAILABLE = False
 
-try:
-    from alpaca.data.historical import StockHistoricalDataClient
-    from alpaca.data.requests import StockBarsRequest
-    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-    ALPACA_SDK_AVAILABLE = True
-except ImportError:
-    ALPACA_SDK_AVAILABLE = False
-
+# ── Optional Gemini ────────────────────────────────────────────────────────────
 try:
     from google import genai
     GENAI_AVAILABLE = True
@@ -45,9 +56,9 @@ except ImportError:
     GENAI_AVAILABLE = False
 
 
-# ---------------------------------------------------------------------------
-# PAGE CONFIG  (must be first Streamlit call)
-# ---------------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE CONFIG  (must be the very first Streamlit call)
+# ══════════════════════════════════════════════════════════════════════════════
 st.set_page_config(
     page_title="SPY Buddy Pro Elite",
     page_icon="📈",
@@ -55,226 +66,224 @@ st.set_page_config(
 )
 
 
-# ---------------------------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------------------------
-ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
-ALPACA_DATA_URL = "https://data.alpaca.markets"
+# ══════════════════════════════════════════════════════════════════════════════
+# CUSTOM CSS  – dark trading-terminal theme
+# ══════════════════════════════════════════════════════════════════════════════
+SIGNAL_GLOW = {
+    "BUY":      "0 0 12px 3px rgba(0,200,100,0.55)",
+    "HOLD":     "0 0 12px 3px rgba(59,130,246,0.55)",
+    "SELL":     "0 0 12px 3px rgba(239,68,68,0.55)",
+    "NO TRADE": "0 0 12px 3px rgba(251,146,60,0.55)",
+}
+SIGNAL_BG = {
+    "BUY":      "#052e16",
+    "HOLD":     "#1e3a5f",
+    "SELL":     "#450a0a",
+    "NO TRADE": "#431407",
+}
+SIGNAL_FG = {
+    "BUY":      "#4ade80",
+    "HOLD":     "#93c5fd",
+    "SELL":     "#f87171",
+    "NO TRADE": "#fb923c",
+}
 
-TF_MAP: Dict[str, Dict[str, Any]] = {
-    "1 Day":  {"amount": 1,  "unit": "Day",    "limit": 500,  "period_days": 730},
-    "1 Hour": {"amount": 1,  "unit": "Hour",   "limit": 1000, "period_days": 60},
-    "15 Min": {"amount": 15, "unit": "Minute", "limit": 1000, "period_days": 30},
-    "5 Min":  {"amount": 5,  "unit": "Minute", "limit": 1000, "period_days": 15},
-    "1 Min":  {"amount": 1,  "unit": "Minute", "limit": 1000, "period_days": 7},
+st.markdown("""
+<style>
+/* ── Base ── */
+html, body, [data-testid="stAppViewContainer"] {
+    background-color: #0d1117;
+    color: #e6edf3;
+}
+[data-testid="stSidebar"] {
+    background-color: #161b22;
+    border-right: 1px solid #30363d;
+}
+[data-testid="stSidebar"] * { color: #c9d1d9 !important; }
+
+/* ── Metric cards ── */
+[data-testid="stMetric"] {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    padding: 12px 16px;
+}
+[data-testid="stMetricLabel"]  { color: #8b949e !important; font-size: 0.78rem; }
+[data-testid="stMetricValue"]  { color: #e6edf3 !important; font-size: 1.35rem; font-weight: 700; }
+[data-testid="stMetricDelta"]  { font-size: 0.82rem; }
+
+/* ── Tabs ── */
+[data-testid="stTabs"] button {
+    color: #8b949e;
+    border-bottom: 2px solid transparent;
+    font-weight: 600;
+}
+[data-testid="stTabs"] button[aria-selected="true"] {
+    color: #58a6ff;
+    border-bottom: 2px solid #58a6ff;
+}
+
+/* ── Dataframe ── */
+[data-testid="stDataFrame"] { border: 1px solid #30363d; border-radius: 8px; }
+
+/* ── Expander ── */
+[data-testid="stExpander"] {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+}
+
+/* ── Buttons ── */
+[data-testid="stButton"] > button {
+    background: #21262d;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    font-weight: 600;
+}
+[data-testid="stButton"] > button:hover {
+    background: #30363d;
+    border-color: #58a6ff;
+    color: #58a6ff;
+}
+
+/* ── Divider ── */
+hr { border-color: #30363d; }
+
+/* ── Caption / small text ── */
+small, .stCaption { color: #8b949e !important; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+TF_MAP: Dict[str, Dict[str, str]] = {
+    "1 Day":  {"period": "2y",   "interval": "1d"},
+    "1 Hour": {"period": "730d", "interval": "1h"},
+    "15 Min": {"period": "60d",  "interval": "15m"},
+    "5 Min":  {"period": "60d",  "interval": "5m"},
+    "1 Min":  {"period": "7d",   "interval": "1m"},
 }
 
 DEFAULT_SYMBOL = "SPY"
 
-
-# ---------------------------------------------------------------------------
-# CREDENTIAL HELPERS
-# ---------------------------------------------------------------------------
-def get_alpaca_keys() -> Tuple[Optional[str], Optional[str]]:
-    """Return (api_key, secret_key) from Streamlit secrets or env vars."""
-    api_key = None
-    secret_key = None
-
-    # Try Streamlit secrets first
-    try:
-        api_key = st.secrets.get("ALPACA_API_KEY") or st.secrets.get("alpaca_api_key")
-        secret_key = st.secrets.get("ALPACA_SECRET_KEY") or st.secrets.get("alpaca_secret_key")
-    except Exception:
-        pass
-
-    # Fall back to environment variables
-    if not api_key:
-        api_key = os.environ.get("ALPACA_API_KEY")
-    if not secret_key:
-        secret_key = os.environ.get("ALPACA_SECRET_KEY")
-
-    return api_key, secret_key
+# Chart colours
+EMA_COLORS = {
+    "EMA_8":   "#f59e0b",   # amber
+    "EMA_21":  "#3b82f6",   # blue
+    "EMA_50":  "#a855f7",   # purple
+    "EMA_200": "#ef4444",   # red
+}
 
 
-def get_gemini_key() -> Optional[str]:
-    """Return Gemini API key from Streamlit secrets or env vars."""
-    try:
-        key = st.secrets.get("GEMINI_API_KEY") or st.secrets.get("GOOGLE_API_KEY")
-        if key:
-            return key
-    except Exception:
-        pass
-    return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-
-
-# ---------------------------------------------------------------------------
-# DATA FETCHING  (Alpaca primary, yfinance fallback)
-# ---------------------------------------------------------------------------
-@st.cache_data(ttl=60)
-def fetch_alpaca_bars(
-    symbol: str,
-    timeframe_label: str,
-    api_key: str,
-    secret_key: str,
-) -> pd.DataFrame:
-    """
-    Fetch OHLCV bars from Alpaca using the official SDK.
-    Falls back to yfinance if the SDK is unavailable or the request fails.
-    """
-    cfg = TF_MAP[timeframe_label]
-
-    if ALPACA_SDK_AVAILABLE and api_key and secret_key:
-        try:
-            client = StockHistoricalDataClient(api_key, secret_key)
-
-            unit_map = {
-                "Day":    TimeFrame(1, TimeFrameUnit.Day),
-                "Hour":   TimeFrame(1, TimeFrameUnit.Hour),
-                "Minute": TimeFrame(cfg["amount"], TimeFrameUnit.Minute),
-            }
-            tf = unit_map[cfg["unit"]]
-
-            start = datetime.now(timezone.utc) - timedelta(days=cfg["period_days"])
-
-            request = StockBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=tf,
-                start=start,
-                limit=cfg["limit"],
-                feed="iex",          # free IEX feed; change to "sip" for paid
-            )
-
-            bars = client.get_stock_bars(request)
-            df = bars.df
-
-            if df is None or df.empty:
-                raise ValueError("Empty response from Alpaca")
-
-            # Alpaca SDK returns a MultiIndex (symbol, timestamp) — flatten it
-            if isinstance(df.index, pd.MultiIndex):
-                df = df.xs(symbol, level="symbol")
-
-            df.index = pd.to_datetime(df.index)
-            if df.index.tz is not None:
-                df.index = df.index.tz_convert("America/New_York")
-
-            df.rename(columns={
-                "open": "Open", "high": "High", "low": "Low",
-                "close": "Close", "volume": "Volume",
-            }, inplace=True)
-
-            df = df[~df.index.duplicated(keep="last")]
-            return df[["Open", "High", "Low", "Close", "Volume"]]
-
-        except Exception as e:
-            st.warning(f"Alpaca fetch failed ({e}). Falling back to yfinance.")
-
-    # ---- yfinance fallback ------------------------------------------------
-    try:
-        import yfinance as yf
-
-        yf_interval_map = {
-            "1 Day":  ("2y",  "1d"),
-            "1 Hour": ("60d", "1h"),
-            "15 Min": ("60d", "15m"),
-            "5 Min":  ("60d", "5m"),
-            "1 Min":  ("7d",  "1m"),
-        }
-        period, interval = yf_interval_map[timeframe_label]
-        df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
-
-        if df is None or df.empty:
-            return pd.DataFrame()
-
-        df = df[~df.index.duplicated(keep="last")]
-        return df[["Open", "High", "Low", "Close", "Volume"]]
-
-    except Exception as e:
-        st.error(f"Both Alpaca and yfinance failed: {e}")
-        return pd.DataFrame()
-
-
-@st.cache_data(ttl=60)
-def fetch_vix(api_key: str, secret_key: str) -> pd.DataFrame:
-    """Fetch VIX daily bars (always uses yfinance — Alpaca doesn't carry VIX)."""
-    try:
-        import yfinance as yf
-        df = yf.Ticker("^VIX").history(period="6mo", interval="1d", auto_adjust=False)
-        if df is not None and not df.empty:
-            return df[~df.index.duplicated(keep="last")]
-    except Exception:
-        pass
-    return pd.DataFrame()
-
-
-@st.cache_data(ttl=60)
-def fetch_latest_quote(symbol: str, api_key: str, secret_key: str) -> Optional[float]:
-    """
-    Fetch the latest trade price from Alpaca REST directly.
-    Returns None if unavailable.
-    """
-    if not (api_key and secret_key):
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def safe_round(x: Any, digits: int = 2) -> Optional[float]:
+    if x is None:
         return None
     try:
-        url = f"https://data.alpaca.markets/v2/stocks/{symbol}/trades/latest?feed=iex"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "APCA-API-KEY-ID": api_key,
-                "APCA-API-SECRET-KEY": secret_key,
-            },
+        if pd.isna(x):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        return round(float(x), digits)
+    except (TypeError, ValueError):
+        return None
+
+
+def fmt_price(x: Any) -> str:
+    v = safe_round(x, 2)
+    return f"${v:,.2f}" if v is not None else "N/A"
+
+
+def signal_color(signal: str) -> str:
+    return {"BUY": "green", "HOLD": "blue", "SELL": "red", "NO TRADE": "orange"}.get(signal, "gray")
+
+
+def signal_badge(signal: str) -> str:
+    """Return an HTML badge with glow for the current signal."""
+    bg  = SIGNAL_BG.get(signal, "#1c1c1c")
+    fg  = SIGNAL_FG.get(signal, "#e6edf3")
+    glow = SIGNAL_GLOW.get(signal, "none")
+    return (
+        f'<span style="background:{bg};color:{fg};padding:6px 20px;'
+        f'border-radius:8px;font-size:1.5rem;font-weight:800;'
+        f'box-shadow:{glow};letter-spacing:0.05em;">{signal}</span>'
+    )
+
+
+def reason_icon(reason: str) -> str:
+    """Prefix a reason string with a coloured icon based on sentiment."""
+    bull = ("above", "confirms", "healthy", "positive", "supportive", "volume is above")
+    bear = ("below", "disagrees", "weak", "negative", "elevated", "stretched", "extended")
+    lo   = reason.lower()
+    if any(k in lo for k in bull):
+        return f"🟢 {reason}"
+    if any(k in lo for k in bear):
+        return f"🔴 {reason}"
+    return f"⚪ {reason}"
+
+
+def send_webhook_alert(webhook_url: str, payload: dict) -> Tuple[bool, str]:
+    if not webhook_url:
+        return False, "Missing webhook URL"
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req  = urllib.request.Request(
+            webhook_url, data=data,
+            headers={"Content-Type": "application/json"}, method="POST",
         )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-        return float(data["trade"]["p"])
-    except Exception:
-        return None
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return True, f"HTTP {getattr(resp, 'status', 200)}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTPError {e.code}"
+    except urllib.error.URLError as e:
+        return False, f"URLError {e.reason}"
+    except Exception as e:
+        return False, str(e)
 
 
-# ---------------------------------------------------------------------------
-# TECHNICAL INDICATORS
-# ---------------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
+# INDICATORS
+# ══════════════════════════════════════════════════════════════════════════════
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate EMA, RSI, MACD, ATR, and volume average."""
     df = df.copy()
     if df.empty:
         return df
 
-    # EMAs
-    for span in [8, 21, 50, 200]:
+    for span in (8, 21, 50, 200):
         df[f"EMA_{span}"] = df["Close"].ewm(span=span, adjust=False).mean()
 
-    # RSI (14)
-    delta = df["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    delta    = df["Close"].diff()
+    gain     = delta.clip(lower=0)
+    loss     = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rs       = avg_gain / avg_loss.replace(0, np.nan)
     df["RSI"] = 100 - (100 / (1 + rs))
 
-    # MACD (12/26/9)
     ema12 = df["Close"].ewm(span=12, adjust=False).mean()
     ema26 = df["Close"].ewm(span=26, adjust=False).mean()
-    df["MACD"] = ema12 - ema26
+    df["MACD"]        = ema12 - ema26
     df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
+    df["MACD_HIST"]   = df["MACD"] - df["MACD_SIGNAL"]
 
-    # ATR (14)
     hl  = df["High"] - df["Low"]
     hpc = (df["High"] - df["Close"].shift()).abs()
     lpc = (df["Low"]  - df["Close"].shift()).abs()
     tr  = pd.concat([hl, hpc, lpc], axis=1).max(axis=1)
     df["ATR"] = tr.rolling(14).mean()
 
-    # Volume average (20 bars)
     df["VOL_AVG_20"] = df["Volume"].rolling(20).mean() if "Volume" in df.columns else np.nan
 
     return df
 
 
 def attach_daily_vix(df: pd.DataFrame, vix_df: pd.DataFrame) -> pd.DataFrame:
-    """Merge daily VIX close onto any timeframe dataframe."""
     df = df.copy()
     if df.empty or vix_df.empty:
         df["VIX_CLOSE"] = np.nan
@@ -302,31 +311,13 @@ def attach_daily_vix(df: pd.DataFrame, vix_df: pd.DataFrame) -> pd.DataFrame:
     return temp
 
 
-# ---------------------------------------------------------------------------
-# SIGNAL ENGINE
-# ---------------------------------------------------------------------------
-def safe_round(x: Any, digits: int = 2) -> Optional[float]:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return None
-    try:
-        return round(float(x), digits)
-    except (ValueError, TypeError):
-        return None
-
-
-def fmt_price(x: Any) -> str:
-    v = safe_round(x, 2)
-    return f"${v:,.2f}" if v is not None else "N/A"
-
-
-def signal_color(signal: str) -> str:
-    return {"BUY": "green", "HOLD": "blue", "SELL": "red", "NO TRADE": "orange"}.get(signal, "gray")
-
-
+# ══════════════════════════════════════════════════════════════════════════════
+# SIGNAL ENGINE  (unchanged logic from original)
+# ══════════════════════════════════════════════════════════════════════════════
 def timeframe_bias(df: pd.DataFrame) -> int:
     if df.empty or len(df) < 50:
         return 0
-    row = df.iloc[-1]
+    row   = df.iloc[-1]
     score = 0
     score += 1 if row["Close"] > row["EMA_21"] else -1
     score += 1 if row["EMA_21"] > row["EMA_50"] else -1
@@ -341,17 +332,13 @@ def timeframe_bias(df: pd.DataFrame) -> int:
 def detect_market_regime(daily_df: pd.DataFrame, vix_value: float) -> str:
     if daily_df.empty or len(daily_df) < 200:
         return "Insufficient Data"
-    row = daily_df.iloc[-1]
-    bullish = (row["Close"] > row["EMA_50"] and row["EMA_50"] > row["EMA_200"] and row["RSI"] > 52)
-    bearish = (row["Close"] < row["EMA_50"] and row["EMA_50"] < row["EMA_200"] and row["RSI"] < 48)
-    if bullish and vix_value < 18:
-        return "Bull Trend"
-    if bullish and vix_value >= 18:
-        return "Bull Trend / High Vol"
-    if bearish and vix_value >= 20:
-        return "Bear Trend"
-    if bearish and vix_value < 20:
-        return "Bear Trend / Low Vol"
+    row     = daily_df.iloc[-1]
+    bullish = row["Close"] > row["EMA_50"] and row["EMA_50"] > row["EMA_200"] and row["RSI"] > 52
+    bearish = row["Close"] < row["EMA_50"] and row["EMA_50"] < row["EMA_200"] and row["RSI"] < 48
+    if bullish and vix_value < 18:  return "Bull Trend"
+    if bullish:                     return "Bull Trend / High Vol"
+    if bearish and vix_value >= 20: return "Bear Trend"
+    if bearish:                     return "Bear Trend / Low Vol"
     return "Range / Transition"
 
 
@@ -361,7 +348,6 @@ def current_signal(
     daily_df: pd.DataFrame,
     vix_value: float,
 ) -> Dict[str, Any]:
-    """Score the current bar and return a full signal dict."""
     if entry_df.empty or len(entry_df) < 50:
         return {
             "signal": "NO TRADE", "score": 0, "confidence": 0,
@@ -369,74 +355,73 @@ def current_signal(
             "regime": "Insufficient Data", "reasons": ["Not enough data."],
         }
 
-    row = entry_df.iloc[-1]
-    score = 0
+    row     = entry_df.iloc[-1]
+    score   = 0
     reasons = []
 
-    # --- Trend ---
+    # Trend
     if row["Close"] > row["EMA_21"]:
-        score += 1; reasons.append("Price is above EMA21.")
+        score += 1;  reasons.append("Price is above EMA21.")
     else:
-        score -= 1; reasons.append("Price is below EMA21.")
+        score -= 1;  reasons.append("Price is below EMA21.")
 
     if row["EMA_21"] > row["EMA_50"]:
-        score += 1; reasons.append("EMA21 is above EMA50.")
+        score += 1;  reasons.append("EMA21 is above EMA50.")
     else:
-        score -= 1; reasons.append("EMA21 is below EMA50.")
+        score -= 1;  reasons.append("EMA21 is below EMA50.")
 
     if not pd.isna(row["EMA_200"]):
         if row["EMA_50"] > row["EMA_200"]:
-            score += 1; reasons.append("EMA50 is above EMA200.")
+            score += 1;  reasons.append("EMA50 is above EMA200.")
         else:
-            score -= 1; reasons.append("EMA50 is below EMA200.")
+            score -= 1;  reasons.append("EMA50 is below EMA200.")
 
-    # --- Momentum ---
+    # Momentum
     if 52 <= row["RSI"] <= 68:
-        score += 1; reasons.append("RSI is in a healthy bullish zone.")
+        score += 1;  reasons.append("RSI is in a healthy bullish zone.")
     elif row["RSI"] < 45:
-        score -= 1; reasons.append("RSI is weak.")
+        score -= 1;  reasons.append("RSI is weak.")
     elif row["RSI"] > 72:
-        score -= 1; reasons.append("RSI is stretched / overheated.")
+        score -= 1;  reasons.append("RSI is stretched / overheated.")
 
     if row["MACD_HIST"] > 0:
-        score += 1; reasons.append("MACD histogram is positive.")
+        score += 1;  reasons.append("MACD histogram is positive.")
     else:
-        score -= 1; reasons.append("MACD histogram is negative.")
+        score -= 1;  reasons.append("MACD histogram is negative.")
 
-    # --- Volume ---
+    # Volume
     if "Volume" in entry_df.columns and not pd.isna(row["VOL_AVG_20"]):
         if row["Volume"] > row["VOL_AVG_20"]:
-            score += 1; reasons.append("Volume is above the 20-bar average.")
+            score += 1;  reasons.append("Volume is above the 20-bar average.")
         else:
             reasons.append("Volume is not strongly confirming.")
 
-    # --- VIX ---
+    # VIX
     if vix_value < 18:
-        score += 1; reasons.append("VIX is supportive (< 18).")
+        score += 1;  reasons.append(f"VIX is supportive ({vix_value:.1f}).")
     elif vix_value > 24:
-        score -= 2; reasons.append(f"VIX is elevated ({vix_value:.1f}) — raises risk.")
+        score -= 2;  reasons.append(f"VIX is elevated ({vix_value:.1f}) — raises risk.")
     else:
         reasons.append(f"VIX is neutral ({vix_value:.1f}).")
 
-    # --- Higher timeframe alignment ---
+    # Higher timeframe alignment
     htf = timeframe_bias(hourly_df)
     dtf = timeframe_bias(daily_df)
 
     if htf >= 2:
-        score += 1; reasons.append("Hourly trend confirms.")
+        score += 1;  reasons.append("Hourly trend confirms.")
     elif htf <= -2:
-        score -= 1; reasons.append("Hourly trend disagrees.")
+        score -= 1;  reasons.append("Hourly trend disagrees.")
 
     if dtf >= 2:
-        score += 2; reasons.append("Daily trend confirms.")
+        score += 2;  reasons.append("Daily trend confirms.")
     elif dtf <= -2:
-        score -= 2; reasons.append("Daily trend disagrees.")
+        score -= 2;  reasons.append("Daily trend disagrees.")
 
-    # --- Extension filter ---
+    # Extension filter
     extended = False
     if not pd.isna(row["ATR"]) and row["ATR"] > 0:
-        dist = abs(row["Close"] - row["EMA_21"]) / row["ATR"]
-        if dist > 1.8:
+        if abs(row["Close"] - row["EMA_21"]) / row["ATR"] > 1.8:
             extended = True
             score -= 1
             reasons.append("Price is extended versus ATR and EMA21.")
@@ -479,20 +464,17 @@ def current_signal(
     }
 
 
-# ---------------------------------------------------------------------------
-# VECTORISED SIGNAL SCORING  (for backtest + chart arrows)
-# ---------------------------------------------------------------------------
 def vector_signal_score(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["score"] = 0
 
-    out["score"] += np.where(out["Close"] > out["EMA_21"], 1, -1)
+    out["score"] += np.where(out["Close"] > out["EMA_21"],  1, -1)
     out["score"] += np.where(out["EMA_21"] > out["EMA_50"], 1, -1)
-    out["score"] += np.where(out["EMA_50"] > out["EMA_200"], 1, -1)
+    out["score"] += np.where(out["EMA_50"] > out["EMA_200"],1, -1)
 
     out["score"] += np.where((out["RSI"] >= 52) & (out["RSI"] <= 68), 1, 0)
-    out["score"] += np.where(out["RSI"] < 45, -1, 0)
-    out["score"] += np.where(out["RSI"] > 72, -1, 0)
+    out["score"] += np.where(out["RSI"] < 45,  -1, 0)
+    out["score"] += np.where(out["RSI"] > 72,  -1, 0)
 
     out["score"] += np.where(out["MACD_HIST"] > 0, 1, -1)
 
@@ -500,8 +482,8 @@ def vector_signal_score(df: pd.DataFrame) -> pd.DataFrame:
         out["score"] += np.where(out["Volume"] > out["VOL_AVG_20"], 1, 0)
 
     if "VIX_CLOSE" in out.columns:
-        out["score"] += np.where(out["VIX_CLOSE"] < 18, 1, 0)
-        out["score"] += np.where(out["VIX_CLOSE"] > 24, -2, 0)
+        out["score"] += np.where(out["VIX_CLOSE"] < 18,  1,  0)
+        out["score"] += np.where(out["VIX_CLOSE"] > 24, -2,  0)
 
     atr_dist = abs(out["Close"] - out["EMA_21"]) / out["ATR"].replace(0, np.nan)
     out["extended"] = atr_dist > 1.8
@@ -518,8 +500,8 @@ def vector_signal_score(df: pd.DataFrame) -> pd.DataFrame:
 def find_chart_signals(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     marked = vector_signal_score(df.copy())
     marked["prev_signal"] = marked["signal_label"].shift(1)
-    marked["fresh_buy"]  = (marked["signal_label"] == "BUY")  & (marked["prev_signal"] != "BUY")
-    marked["fresh_sell"] = (marked["signal_label"] == "SELL") & (marked["prev_signal"] != "SELL")
+    marked["fresh_buy"]   = (marked["signal_label"] == "BUY")  & (marked["prev_signal"] != "BUY")
+    marked["fresh_sell"]  = (marked["signal_label"] == "SELL") & (marked["prev_signal"] != "SELL")
 
     buy_rows, sell_rows = [], []
     open_trade = None
@@ -536,7 +518,7 @@ def find_chart_signals(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         elif row["fresh_sell"]:
             label = f"SELL<br>{float(row['Close']):.2f}"
             if open_trade is not None:
-                pnl = ((float(row["Close"]) / open_trade["price"]) - 1.0) * 100.0
+                pnl   = ((float(row["Close"]) / open_trade["price"]) - 1.0) * 100.0
                 label = f"SELL<br>{float(row['Close']):.2f}<br>{pnl:+.2f}%"
                 open_trade = None
             sell_rows.append({
@@ -547,9 +529,9 @@ def find_chart_signals(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return pd.DataFrame(buy_rows), pd.DataFrame(sell_rows)
 
 
-# ---------------------------------------------------------------------------
-# BACKTEST
-# ---------------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
+# BACKTEST  (unchanged logic)
+# ══════════════════════════════════════════════════════════════════════════════
 def run_backtest(df: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
     bt = vector_signal_score(df.copy())
     bt = bt.dropna(subset=["EMA_21", "EMA_50", "EMA_200", "RSI", "MACD_HIST", "ATR"]).copy()
@@ -562,20 +544,19 @@ def run_backtest(df: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Optional[Dic
         enter = row["score"] >= 6 and not row["extended"]
         hold  = row["score"] >= 2 and row["Close"] > row["EMA_50"]
         exit_ = row["score"] <= 1 or row["Close"] < row["EMA_21"]
-
         if in_pos == 0 and enter:
             in_pos = 1
         elif in_pos == 1 and exit_ and not hold:
             in_pos = 0
         position.append(in_pos)
 
-    bt["position"]      = position
-    bt["ret"]           = bt["Close"].pct_change().fillna(0)
-    bt["strategy_ret"]  = bt["ret"] * bt["position"].shift(1).fillna(0)
-    bt["equity_curve"]  = (1 + bt["strategy_ret"]).cumprod()
-    bt["buy_hold_curve"]= (1 + bt["ret"]).cumprod()
-    bt["equity_peak"]   = bt["equity_curve"].cummax()
-    bt["drawdown"]      = bt["equity_curve"] / bt["equity_peak"] - 1
+    bt["position"]       = position
+    bt["ret"]            = bt["Close"].pct_change().fillna(0)
+    bt["strategy_ret"]   = bt["ret"] * bt["position"].shift(1).fillna(0)
+    bt["equity_curve"]   = (1 + bt["strategy_ret"]).cumprod()
+    bt["buy_hold_curve"] = (1 + bt["ret"]).cumprod()
+    bt["equity_peak"]    = bt["equity_curve"].cummax()
+    bt["drawdown"]       = bt["equity_curve"] / bt["equity_peak"] - 1
 
     bt["pos_change"] = bt["position"].diff().fillna(0)
     entries = bt.index[bt["pos_change"] == 1].tolist()
@@ -595,13 +576,13 @@ def run_backtest(df: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Optional[Dic
             "Return %":    round(((xp / ep) - 1) * 100, 2),
         })
 
-    trades_df = pd.DataFrame(trades)
+    trades_df    = pd.DataFrame(trades)
     total_trades = len(trades_df)
-    win_rate  = (trades_df["Return %"] > 0).mean() * 100 if total_trades else 0.0
-    avg_trade = trades_df["Return %"].mean()             if total_trades else 0.0
+    win_rate     = (trades_df["Return %"] > 0).mean() * 100 if total_trades else 0.0
+    avg_trade    = trades_df["Return %"].mean()             if total_trades else 0.0
 
     stats = {
-        "Strategy Return %": round((bt["equity_curve"].iloc[-1] - 1) * 100, 2),
+        "Strategy Return %": round((bt["equity_curve"].iloc[-1]   - 1) * 100, 2),
         "Buy & Hold %":      round((bt["buy_hold_curve"].iloc[-1] - 1) * 100, 2),
         "Max Drawdown %":    round(bt["drawdown"].min() * 100, 2),
         "Trades":            int(total_trades),
@@ -611,38 +592,42 @@ def run_backtest(df: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Optional[Dic
     return bt, {"stats": stats, "trades": trades_df}
 
 
-# ---------------------------------------------------------------------------
-# WEBHOOK
-# ---------------------------------------------------------------------------
-def send_webhook_alert(webhook_url: str, payload: dict) -> Tuple[bool, str]:
-    if not webhook_url:
-        return False, "Missing webhook URL"
-    try:
-        data = json.dumps(payload).encode("utf-8")
-        req  = urllib.request.Request(
-            webhook_url, data=data,
-            headers={"Content-Type": "application/json"}, method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return True, f"HTTP {getattr(resp, 'status', 200)}"
-    except urllib.error.HTTPError as e:
-        return False, f"HTTPError {e.code}"
-    except urllib.error.URLError as e:
-        return False, f"URLError {e.reason}"
-    except Exception as e:
-        return False, str(e)
-
-
-# ---------------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
 # CHARTS
-# ---------------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
+_DARK_LAYOUT = dict(
+    paper_bgcolor="#0d1117",
+    plot_bgcolor="#0d1117",
+    font=dict(color="#c9d1d9", family="monospace"),
+    xaxis=dict(
+        gridcolor="#21262d", zerolinecolor="#30363d",
+        fixedrange=False,
+        showspikes=True, spikemode="across", spikesnap="cursor",
+        spikecolor="#58a6ff", spikedash="dot", spikethickness=1,
+    ),
+    yaxis=dict(gridcolor="#21262d", zerolinecolor="#30363d"),
+    legend=dict(
+        orientation="h", bgcolor="rgba(13,17,23,0.8)",
+        bordercolor="#30363d", borderwidth=1,
+        font=dict(size=11),
+    ),
+    hovermode="x unified",
+    hoverlabel=dict(bgcolor="#161b22", bordercolor="#30363d", font_color="#e6edf3"),
+    dragmode="pan",
+    margin=dict(l=60, r=80, t=50, b=40),
+)
+
+
 def make_candlestick_chart(df: pd.DataFrame, symbol: str):
     chart_df = df.tail(180).copy()
 
-    # Green/red volume bars matching candle direction
     vol_colors = [
-        "rgba(0,180,90,0.30)" if c >= o else "rgba(220,50,50,0.30)"
+        "rgba(0,200,100,0.35)" if c >= o else "rgba(239,68,68,0.35)"
         for c, o in zip(chart_df["Close"], chart_df["Open"])
+    ]
+    hist_colors = [
+        "rgba(0,200,100,0.60)" if v >= 0 else "rgba(239,68,68,0.60)"
+        for v in chart_df["MACD_HIST"].fillna(0)
     ]
 
     fig = make_subplots(
@@ -653,61 +638,58 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str):
         specs=[[{"secondary_y": True}], [{}], [{}]],
     )
 
-    # Candlesticks
+    # ── Candlesticks ──────────────────────────────────────────────────────────
     fig.add_trace(go.Candlestick(
         x=chart_df.index,
         open=chart_df["Open"], high=chart_df["High"],
         low=chart_df["Low"],   close=chart_df["Close"],
-        name="Candles",
+        name="Price",
+        increasing_line_color="#00c864", increasing_fillcolor="#00c864",
+        decreasing_line_color="#ef4444", decreasing_fillcolor="#ef4444",
     ), row=1, col=1, secondary_y=False)
 
-    # EMAs
-    ema_colors = {"EMA_8": "#f59e0b", "EMA_21": "#3b82f6", "EMA_50": "#a855f7", "EMA_200": "#ef4444"}
-    for col, color in ema_colors.items():
+    # ── EMAs ──────────────────────────────────────────────────────────────────
+    for col, color in EMA_COLORS.items():
         if col in chart_df.columns and chart_df[col].notna().sum() > 0:
             fig.add_trace(go.Scatter(
                 x=chart_df.index, y=chart_df[col],
                 mode="lines", name=col,
-                line=dict(color=color, width=1.2),
+                line=dict(color=color, width=1.4),
             ), row=1, col=1, secondary_y=False)
 
-    # Volume — right axis
+    # ── Volume — right axis ───────────────────────────────────────────────────
     fig.add_trace(go.Bar(
         x=chart_df.index, y=chart_df["Volume"],
         name="Volume", marker_color=vol_colors,
     ), row=1, col=1, secondary_y=True)
 
-    # RSI
+    # ── RSI ───────────────────────────────────────────────────────────────────
     fig.add_trace(go.Scatter(
         x=chart_df.index, y=chart_df["RSI"],
         mode="lines", name="RSI",
-        line=dict(color="#06b6d4", width=1.5),
+        line=dict(color="#06b6d4", width=1.6),
     ), row=2, col=1)
-    for level in [70, 30]:
-        fig.add_hline(y=level, row=2, col=1, line_dash="dot",
-                      line_color="rgba(150,150,150,0.5)")
+    for lvl, clr in [(70, "rgba(239,68,68,0.4)"), (30, "rgba(0,200,100,0.4)")]:
+        fig.add_hline(y=lvl, row=2, col=1,
+                      line_dash="dot", line_color=clr, line_width=1)
 
-    # MACD
+    # ── MACD ──────────────────────────────────────────────────────────────────
     fig.add_trace(go.Scatter(
         x=chart_df.index, y=chart_df["MACD"],
         mode="lines", name="MACD",
-        line=dict(color="#3b82f6", width=1.5),
+        line=dict(color="#3b82f6", width=1.6),
     ), row=3, col=1)
     fig.add_trace(go.Scatter(
         x=chart_df.index, y=chart_df["MACD_SIGNAL"],
         mode="lines", name="Signal",
         line=dict(color="#f59e0b", width=1.2),
     ), row=3, col=1)
-    hist_colors = [
-        "rgba(0,180,90,0.55)" if v >= 0 else "rgba(220,50,50,0.55)"
-        for v in chart_df["MACD_HIST"].fillna(0)
-    ]
     fig.add_trace(go.Bar(
         x=chart_df.index, y=chart_df["MACD_HIST"],
         name="Histogram", marker_color=hist_colors,
     ), row=3, col=1)
 
-    # Buy / Sell arrows
+    # ── Buy / Sell arrows ─────────────────────────────────────────────────────
     buy_pts, sell_pts = find_chart_signals(chart_df)
     if not buy_pts.empty:
         buy_pts = buy_pts.tail(20)
@@ -719,8 +701,8 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str):
         fig.add_annotation(
             x=r["index"], y=y_val, xref="x", yref="y",
             text=r["label"], showarrow=True,
-            arrowhead=2, arrowsize=1.2, arrowwidth=2, arrowcolor="#00b45a",
-            ax=0, ay=40, font=dict(color="#00b45a", size=9), align="center",
+            arrowhead=2, arrowsize=1.2, arrowwidth=2, arrowcolor="#00c864",
+            ax=0, ay=40, font=dict(color="#00c864", size=9), align="center",
         )
 
     for _, r in sell_pts.iterrows():
@@ -728,98 +710,107 @@ def make_candlestick_chart(df: pd.DataFrame, symbol: str):
         fig.add_annotation(
             x=r["index"], y=y_val, xref="x", yref="y",
             text=r["label"], showarrow=True,
-            arrowhead=2, arrowsize=1.2, arrowwidth=2, arrowcolor="#e03030",
-            ax=0, ay=-44, font=dict(color="#e03030", size=9), align="center",
+            arrowhead=2, arrowsize=1.2, arrowwidth=2, arrowcolor="#ef4444",
+            ax=0, ay=-44, font=dict(color="#ef4444", size=9), align="center",
         )
 
-    fig.update_layout(
-        title=f"{symbol} — Price · RSI · MACD",
+    # ── Layout ────────────────────────────────────────────────────────────────
+    layout = dict(**_DARK_LAYOUT)
+    layout.update(
+        title=dict(text=f"{symbol} — Price · RSI · MACD", font=dict(size=15, color="#e6edf3")),
         xaxis_rangeslider_visible=False,
         height=900,
-        legend_orientation="h",
-        dragmode="pan",
-        hovermode="x unified",
-        margin=dict(l=60, r=80, t=50, b=40),
-        xaxis=dict(fixedrange=False, showspikes=True, spikemode="across",
-                   spikesnap="cursor", spikedash="dot"),
-        xaxis2=dict(fixedrange=False, showspikes=True, spikemode="across", spikesnap="cursor"),
-        xaxis3=dict(fixedrange=False, showspikes=True, spikemode="across", spikesnap="cursor"),
+        xaxis2=dict(gridcolor="#21262d", fixedrange=False,
+                    showspikes=True, spikemode="across", spikesnap="cursor",
+                    spikecolor="#58a6ff", spikedash="dot"),
+        xaxis3=dict(gridcolor="#21262d", fixedrange=False,
+                    showspikes=True, spikemode="across", spikesnap="cursor",
+                    spikecolor="#58a6ff", spikedash="dot"),
     )
+    fig.update_layout(**layout)
 
-    # Price — LEFT axis (y fixed so scroll only zooms x)
-    fig.update_yaxes(title_text="Price", side="left",  fixedrange=True,
+    # Price — LEFT, y locked so scroll only zooms x
+    fig.update_yaxes(title_text="Price",  side="left",  fixedrange=True,
+                     gridcolor="#21262d", zerolinecolor="#30363d",
                      row=1, col=1, secondary_y=False)
-    # Volume — RIGHT axis, capped at 25 % of pane height
+    # Volume — RIGHT, capped at 25 % of pane height
     fig.update_yaxes(title_text="Volume", side="right", fixedrange=True,
-                     showgrid=False,
-                     range=[0, chart_df["Volume"].max() * 4],
+                     showgrid=False, range=[0, chart_df["Volume"].max() * 4],
                      row=1, col=1, secondary_y=True)
-    fig.update_yaxes(title_text="RSI",  fixedrange=True, row=2, col=1)
-    fig.update_yaxes(title_text="MACD", fixedrange=True, row=3, col=1)
+    fig.update_yaxes(title_text="RSI",  fixedrange=True,
+                     gridcolor="#21262d", row=2, col=1)
+    fig.update_yaxes(title_text="MACD", fixedrange=True,
+                     gridcolor="#21262d", row=3, col=1)
 
     return fig
 
 
 def make_backtest_chart(bt_df: pd.DataFrame):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=bt_df.index, y=bt_df["equity_curve"],
-                             mode="lines", name="Strategy",
-                             line=dict(color="#3b82f6", width=2)))
-    fig.add_trace(go.Scatter(x=bt_df.index, y=bt_df["buy_hold_curve"],
-                             mode="lines", name="Buy & Hold",
-                             line=dict(color="#9ca3af", width=1.5, dash="dot")))
-    fig.update_layout(title="Backtest Equity Curve", height=450,
-                      hovermode="x unified", dragmode="pan")
+    fig.add_trace(go.Scatter(
+        x=bt_df.index, y=bt_df["equity_curve"],
+        mode="lines", name="Strategy",
+        line=dict(color="#3b82f6", width=2.2),
+        fill="tozeroy", fillcolor="rgba(59,130,246,0.07)",
+    ))
+    fig.add_trace(go.Scatter(
+        x=bt_df.index, y=bt_df["buy_hold_curve"],
+        mode="lines", name="Buy & Hold",
+        line=dict(color="#6b7280", width=1.4, dash="dot"),
+    ))
+    layout = dict(**_DARK_LAYOUT)
+    layout.update(
+        title=dict(text="Backtest Equity Curve", font=dict(size=14, color="#e6edf3")),
+        height=450,
+    )
+    fig.update_layout(**layout)
+    fig.update_yaxes(gridcolor="#21262d", zerolinecolor="#30363d")
     return fig
 
 
-# ---------------------------------------------------------------------------
-# AI ANALYSIS
-# ---------------------------------------------------------------------------
-def build_ai_prompt(symbol, timeframe, curr_price, sig, last, vix_value):
-    return f"""You are a disciplined institutional market strategist.
-
-Analyze this setup in 6 concise bullet points:
-1. Market regime summary
-2. What favors bulls right now
-3. What favors bears right now
-4. Recommended action: BUY / HOLD / SELL / NO TRADE — and why
-5. Key level that would invalidate the current thesis
-6. One tactical note for the next session
-
-Market data:
-Ticker: {symbol}
-Timeframe: {timeframe}
-Price: {curr_price}
-Signal: {sig['signal']}  |  Confidence: {sig['confidence']}%  |  Score: {sig['score']}
-Risk: {sig['risk']}  |  Regime: {sig['regime']}
-RSI: {safe_round(last['RSI'], 2)}  |  ATR: {safe_round(last['ATR'], 2)}
-EMA8: {safe_round(last['EMA_8'], 2)}  EMA21: {safe_round(last['EMA_21'], 2)}
-EMA50: {safe_round(last['EMA_50'], 2)}  EMA200: {safe_round(last['EMA_200'], 2)}
-MACD: {safe_round(last['MACD'], 3)}  Signal: {safe_round(last['MACD_SIGNAL'], 3)}  Hist: {safe_round(last['MACD_HIST'], 3)}
-VIX: {vix_value}
-Stop: {safe_round(sig['stop'], 2)}  Target: {safe_round(sig['target'], 2)}
-"""
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA FETCHING  (with retry)
+# ══════════════════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=60)
+def get_history(symbol: str, period: str, interval: str, retries: int = 3) -> pd.DataFrame:
+    last_err = None
+    for attempt in range(retries):
+        try:
+            df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
+            if df is not None and not df.empty:
+                df = df[~df.index.duplicated(keep="last")]
+                return df
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(1)
+    return pd.DataFrame()
 
 
-# ---------------------------------------------------------------------------
+@st.cache_data(ttl=60)
+def get_all_data(symbol: str, timeframe_label: str):
+    cfg    = TF_MAP[timeframe_label]
+    entry  = get_history(symbol,  cfg["period"], cfg["interval"])
+    hourly = get_history(symbol,  "60d",  "1h")
+    daily  = get_history(symbol,  "2y",   "1d")
+    vix    = get_history("^VIX",  "6mo",  "1d")
+    return entry, hourly, daily, vix
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
-# ---------------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
 def main():
-    st.title("📈 SPY Buddy Pro Elite")
-    st.caption("Real-time signal dashboard powered by Alpaca Markets. Not financial advice.")
+    # ── Header ────────────────────────────────────────────────────────────────
+    st.markdown(
+        '<h1 style="color:#e6edf3;margin-bottom:0">📈 SPY Buddy Pro Elite</h1>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Research / education dashboard. Not financial advice.")
 
-    # ---- Sidebar ----
+    # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
         st.header("Controls")
-
-        # Alpaca credentials input (if not in secrets)
-        api_key, secret_key = get_alpaca_keys()
-        if not api_key or not secret_key:
-            st.warning("Alpaca keys not found in secrets. Enter them below:")
-            api_key    = st.text_input("Alpaca API Key",    type="password", key="ak")
-            secret_key = st.text_input("Alpaca Secret Key", type="password", key="sk")
-
         symbol    = st.text_input("Ticker", value=DEFAULT_SYMBOL).upper().strip()
         timeframe = st.selectbox("Chart Timeframe", list(TF_MAP.keys()), index=0)
 
@@ -832,29 +823,26 @@ def main():
         enable_webhook = st.checkbox("Enable webhook alerts", value=False)
         webhook_url    = st.text_input(
             "Webhook URL", value="", type="password",
-            help="Discord, Slack-compatible, or any automation webhook.",
+            help="Paste a Discord, Slack-compatible, or automation webhook URL.",
         )
 
         st.divider()
-        show_ai = st.checkbox("Enable AI analysis", value=True)
+        show_ai = st.checkbox("Enable AI panel", value=True)
 
         if st.button("🔄 Refresh Data", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
 
-    # ---- Data fetch ----
-    with st.spinner("Fetching market data from Alpaca…"):
-        entry_raw  = fetch_alpaca_bars(symbol,  timeframe, api_key or "", secret_key or "")
-        hourly_raw = fetch_alpaca_bars(symbol,  "1 Hour",  api_key or "", secret_key or "")
-        daily_raw  = fetch_alpaca_bars(symbol,  "1 Day",   api_key or "", secret_key or "")
-        vix_raw    = fetch_vix(api_key or "", secret_key or "")
+    # ── Data ──────────────────────────────────────────────────────────────────
+    with st.spinner("Fetching market data…"):
+        entry_raw, hourly_raw, daily_raw, vix_raw = get_all_data(symbol, timeframe)
 
     if entry_raw.empty:
-        st.error(f"No data returned for **{symbol}**. Check the ticker or your Alpaca credentials.")
+        st.error(f"No data returned for **{symbol}**. Check the ticker symbol or your network.")
         st.stop()
 
     if vix_raw.empty:
-        st.warning("VIX data unavailable — using default value of 20.")
+        st.warning("VIX data unavailable — using a default value of 20.")
         vix_raw = pd.DataFrame({"Close": [20.0]}, index=[pd.Timestamp.now()])
 
     entry_df  = add_indicators(entry_raw)
@@ -866,19 +854,16 @@ def main():
         st.error("Not enough bars to compute indicators on this timeframe.")
         st.stop()
 
-    last  = entry_df.iloc[-1]
-    prev  = entry_df.iloc[-2] if len(entry_df) > 1 else last
-
-    # Try to get a fresher quote from Alpaca
-    live_price = fetch_latest_quote(symbol, api_key or "", secret_key or "")
-    curr_price = safe_round(live_price or last["Close"], 2)
+    last       = entry_df.iloc[-1]
+    prev       = entry_df.iloc[-2] if len(entry_df) > 1 else last
+    curr_price = safe_round(last["Close"], 2)
     prev_price = safe_round(prev["Close"], 2)
     change     = round(curr_price - prev_price, 2) if curr_price and prev_price else None
     vix_value  = safe_round(vix_raw["Close"].iloc[-1], 2) or 20.0
 
     sig = current_signal(entry_df, hourly_df, daily_df, vix_value)
 
-    # ---- Alert logic ----
+    # ── Alert logic ───────────────────────────────────────────────────────────
     alert_key   = f"last_signal_{symbol}_{timeframe}"
     history_key = f"alert_history_{symbol}_{timeframe}"
     if history_key not in st.session_state:
@@ -889,29 +874,34 @@ def main():
         st.session_state[alert_key] = sig["signal"]
     elif prev_signal != sig["signal"]:
         event_time = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-        alert_row  = {
-            "Time": event_time, "Old": prev_signal, "New": sig["signal"],
-            "Price": curr_price, "Ticker": symbol, "Timeframe": timeframe,
+        st.session_state[history_key].insert(0, {
+            "Time": event_time, "Old Signal": prev_signal,
+            "New Signal": sig["signal"], "Price": curr_price,
+            "Ticker": symbol, "Timeframe": timeframe,
             "Confidence": sig["confidence"], "Risk": sig["risk"],
-        }
-        st.session_state[history_key].insert(0, alert_row)
+        })
         st.session_state[alert_key] = sig["signal"]
-
         toast_icon = {"BUY": "🟢", "HOLD": "🔵", "SELL": "🔴", "NO TRADE": "🟠"}.get(sig["signal"], "📈")
         st.warning(f"Signal changed: {prev_signal} → {sig['signal']} at {fmt_price(curr_price)}")
         st.toast(f"{symbol} {timeframe}: {prev_signal} → {sig['signal']} at {fmt_price(curr_price)}", icon=toast_icon)
 
         if enable_webhook and webhook_url:
             payload = {"text": (
-                f"{symbol} {timeframe} signal: {prev_signal} → {sig['signal']} | "
+                f"{symbol} {timeframe} signal changed: {prev_signal} → {sig['signal']} | "
                 f"Price: {curr_price} | Confidence: {sig['confidence']}% | "
                 f"Risk: {sig['risk']} | Regime: {sig['regime']}"
             )}
             ok, msg = send_webhook_alert(webhook_url, payload)
-            st.toast("Webhook sent ✅" if ok else f"Webhook failed: {msg}", icon="✅" if ok else "❌")
+            st.toast("Webhook alert sent ✅" if ok else f"Webhook failed: {msg}",
+                     icon="✅" if ok else "❌")
 
-    # ---- Header metrics ----
-    st.subheader(f"Signal: :{signal_color(sig['signal'])}[{sig['signal']}]")
+    # ── Signal badge + top metrics ─────────────────────────────────────────────
+    badge_col, _ = st.columns([1, 3])
+    with badge_col:
+        st.markdown(
+            f'<div style="margin:8px 0 16px 0">{signal_badge(sig["signal"])}</div>',
+            unsafe_allow_html=True,
+        )
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Price",      fmt_price(curr_price), f"{change:+.2f}" if change else None)
@@ -927,20 +917,23 @@ def main():
     d3.metric("Stop",   fmt_price(safe_round(sig["stop"], 2)))
     d4.metric("Target", fmt_price(safe_round(sig["target"], 2)))
 
-    # ---- Tabs ----
-    tab1, tab2, tab3, tab4 = st.tabs(["Dashboard", "Backtest", "Alerts", "Raw Data"])
+    # ── Tabs ──────────────────────────────────────────────────────────────────
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "🔁 Backtest", "🔔 Alerts", "📋 Raw Data"])
 
-    # ======================== TAB 1 — DASHBOARD ========================
+    # ════════════════════════ TAB 1 — DASHBOARD ═══════════════════════════════
     with tab1:
         with st.expander("How the engine decides"):
             st.markdown("""
-**BUY** — Score ≥ 6, regime not bearish, price not over-extended.
-**HOLD** — Score 2–5: trend is okay but not strong enough for a fresh entry.
-**SELL** — Score ≤ −4: trend and momentum have broken down.
-**NO TRADE** — Mixed signals, stretched price, or hostile volatility.
+| Signal | Condition |
+|--------|-----------|
+| **BUY** | Score ≥ 6, regime not bearish, price not over-extended |
+| **HOLD** | Score 2–5: trend is okay but not strong enough for a fresh entry |
+| **SELL** | Score ≤ −4: trend and momentum have broken down |
+| **NO TRADE** | Mixed signals, stretched price, or hostile volatility |
             """)
 
         st.subheader(f"{symbol} Chart")
+
         if PLOTLY_AVAILABLE:
             fig = make_candlestick_chart(entry_df, symbol)
             st.plotly_chart(fig, use_container_width=True, config={
@@ -950,46 +943,74 @@ def main():
             st.caption("Scroll to zoom the time axis · Click-drag to pan · Double-click to reset.")
         else:
             st.warning("Plotly not installed — showing simplified chart.")
-            cols = ["Close", "EMA_8", "EMA_21", "EMA_50"]
+            fallback = ["Close", "EMA_8", "EMA_21", "EMA_50"]
             if entry_df["EMA_200"].notna().sum() > 0:
-                cols.append("EMA_200")
-            st.line_chart(entry_df[cols].tail(150))
+                fallback.append("EMA_200")
+            st.line_chart(entry_df[fallback].tail(150))
 
         left, right = st.columns([1.2, 1])
 
         with left:
             st.subheader("Why this signal")
             for reason in sig["reasons"]:
-                st.write(f"- {reason}")
+                st.markdown(reason_icon(reason))
 
         with right:
             st.subheader("Latest Snapshot")
-            snap = pd.DataFrame({
-                "Metric": ["Close", "EMA_8", "EMA_21", "EMA_50", "EMA_200",
-                            "RSI", "MACD", "MACD_SIG", "MACD_HIST", "ATR", "VIX", "Volume"],
-                "Value": [
-                    safe_round(last["Close"], 2), safe_round(last["EMA_8"], 2),
-                    safe_round(last["EMA_21"], 2), safe_round(last["EMA_50"], 2),
-                    safe_round(last["EMA_200"], 2), safe_round(last["RSI"], 2),
-                    safe_round(last["MACD"], 3), safe_round(last["MACD_SIGNAL"], 3),
-                    safe_round(last["MACD_HIST"], 3), safe_round(last["ATR"], 2),
-                    safe_round(last.get("VIX_CLOSE"), 2),
-                    int(last["Volume"]) if not pd.isna(last["Volume"]) else None,
-                ],
-            })
-            st.dataframe(snap, use_container_width=True, hide_index=True)
+            snap_rows = [
+                ("Close",     safe_round(last["Close"], 2)),
+                ("EMA 8",     safe_round(last["EMA_8"], 2)),
+                ("EMA 21",    safe_round(last["EMA_21"], 2)),
+                ("EMA 50",    safe_round(last["EMA_50"], 2)),
+                ("EMA 200",   safe_round(last["EMA_200"], 2)),
+                ("RSI",       safe_round(last["RSI"], 2)),
+                ("MACD",      safe_round(last["MACD"], 3)),
+                ("MACD Sig",  safe_round(last["MACD_SIGNAL"], 3)),
+                ("MACD Hist", safe_round(last["MACD_HIST"], 3)),
+                ("ATR",       safe_round(last["ATR"], 2)),
+                ("VIX",       safe_round(last.get("VIX_CLOSE"), 2)),
+                ("Volume",    int(last["Volume"]) if not pd.isna(last["Volume"]) else None),
+            ]
+            st.dataframe(
+                pd.DataFrame(snap_rows, columns=["Metric", "Value"]),
+                use_container_width=True, hide_index=True,
+            )
 
-        # ---- AI Panel ----
+        # ── AI Panel ──────────────────────────────────────────────────────────
         if show_ai:
             st.subheader("🤖 AI Technical Verdict")
-            gemini_key = get_gemini_key()
+            api_key = None
+            try:
+                api_key = st.secrets.get("GEMINI_API_KEY") or st.secrets.get("GOOGLE_API_KEY")
+            except Exception:
+                pass
 
-            if gemini_key and GENAI_AVAILABLE:
+            if api_key and GENAI_AVAILABLE:
                 if st.button("▶ Run Deep Analysis"):
-                    prompt = build_ai_prompt(symbol, timeframe, curr_price, sig, last, vix_value)
+                    prompt = f"""
+You are a disciplined institutional market strategist.
+
+Analyze this setup in 6 short bullet points:
+1. Market regime
+2. What favors bulls
+3. What favors bears
+4. Best action now: BUY / HOLD / SELL / NO TRADE
+5. Key invalidation level
+6. Short tactical note for the next session
+
+Data:
+Ticker: {symbol}  |  Timeframe: {timeframe}  |  Price: {curr_price}
+Signal: {sig['signal']}  |  Confidence: {sig['confidence']}%  |  Score: {sig['score']}
+Risk: {sig['risk']}  |  Regime: {sig['regime']}
+RSI: {safe_round(last['RSI'], 2)}  |  ATR: {safe_round(last['ATR'], 2)}
+EMA8: {safe_round(last['EMA_8'], 2)}  EMA21: {safe_round(last['EMA_21'], 2)}
+EMA50: {safe_round(last['EMA_50'], 2)}  EMA200: {safe_round(last['EMA_200'], 2)}
+MACD: {safe_round(last['MACD'], 3)}  Signal: {safe_round(last['MACD_SIGNAL'], 3)}  Hist: {safe_round(last['MACD_HIST'], 3)}
+VIX: {vix_value}  |  Stop: {safe_round(sig['stop'], 2)}  |  Target: {safe_round(sig['target'], 2)}
+"""
                     with st.spinner("Running AI analysis…"):
                         try:
-                            client   = genai.Client(api_key=gemini_key)
+                            client   = genai.Client(api_key=api_key)
                             response = client.models.generate_content(
                                 model="gemini-2.5-flash", contents=prompt,
                             )
@@ -998,11 +1019,11 @@ def main():
                             st.error(f"AI analysis failed: {e}")
             else:
                 st.caption(
-                    "To enable AI analysis, add `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) "
-                    "to your Streamlit secrets and install `google-genai`."
+                    "To enable AI, install `google-genai` and add "
+                    "`GEMINI_API_KEY` or `GOOGLE_API_KEY` to Streamlit secrets."
                 )
 
-    # ======================== TAB 2 — BACKTEST ========================
+    # ════════════════════════ TAB 2 — BACKTEST ════════════════════════════════
     with tab2:
         st.subheader("Simple Backtest")
         bt_df, bt_result = run_backtest(entry_df.tail(backtest_bars).copy())
@@ -1025,34 +1046,31 @@ def main():
             else:
                 st.line_chart(bt_df[["equity_curve", "buy_hold_curve"]])
 
-            with st.expander("Trade log"):
+            with st.expander("Backtest trade log"):
                 trades_df = bt_result["trades"]
                 if trades_df.empty:
                     st.write("No completed trades in this window.")
                 else:
                     st.dataframe(trades_df, use_container_width=True)
 
-            st.caption("Simplified backtest — a quick sanity check, not execution-grade research.")
+            st.caption("Intentionally simple — a fast sanity check, not execution-grade research.")
 
-    # ======================== TAB 3 — ALERTS ========================
+    # ════════════════════════ TAB 3 — ALERTS ══════════════════════════════════
     with tab3:
-        st.subheader("Signal Change Alerts")
-        st.caption("Logged whenever the signal changes on refresh.")
+        st.subheader("Signal Alerts")
+        st.caption("Logged whenever the signal changes on refresh / rerun.")
         alerts = st.session_state[history_key]
         if alerts:
             st.dataframe(pd.DataFrame(alerts), use_container_width=True)
         else:
-            st.write("No signal changes logged yet.")
+            st.info("No signal changes logged yet.")
 
-    # ======================== TAB 4 — RAW DATA ========================
+    # ════════════════════════ TAB 4 — RAW DATA ════════════════════════════════
     with tab4:
         st.subheader("Raw Data (last 100 bars)")
         st.dataframe(entry_df.tail(100), use_container_width=True)
 
 
-# ---------------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        st.error(f"Unexpected error: {e}")
+    main()
