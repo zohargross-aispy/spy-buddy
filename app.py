@@ -540,14 +540,15 @@ o4.metric("Mid", fmt_money(quote_mid))
 o5.metric("Last", fmt_money(last_option_trade))
 o6.metric("Spread", fmt_money(quality["spread"]))
 
-g1, g2, g3, g4, g5 = st.columns(5)
-g1.metric("Delta", fmt_num(delta, 3))
-g2.metric("Gamma", fmt_num(gamma, 4))
-g3.metric("Theta", fmt_num(theta, 4))
-g4.metric("Vega", fmt_num(vega, 4))
-g5.metric("IV", fmt_num(iv, 3))
+if any(x is not None for x in [delta, gamma, theta, vega, iv]):
+    g1, g2, g3, g4, g5 = st.columns(5)
+    g1.metric("Delta", fmt_num(delta, 3))
+    g2.metric("Gamma", fmt_num(gamma, 4))
+    g3.metric("Theta", fmt_num(theta, 4))
+    g4.metric("Vega", fmt_num(vega, 4))
+    g5.metric("IV", fmt_num(iv, 3))
 
-st.subheader("Contract Quality Filter")
+st.subheader("Contract Quality")
 q1, q2, q3, q4 = st.columns(4)
 q1.metric("Quality Score", quality["score"])
 q2.metric("Quality Verdict", "PASS" if quality["quality_ok"] else "FAIL")
@@ -558,7 +559,7 @@ with st.expander("Why this contract passed / failed"):
     for r in quality["reasons"]:
         st.write(f"- {r}")
 
-st.subheader("Options State Engine")
+st.subheader("Trade State")
 s1, s2, s3 = st.columns(3)
 s1.metric("State", state)
 s2.metric("Holding this contract?", "Yes" if has_position else "No")
@@ -632,7 +633,7 @@ with p4:
 with p5:
     min_rr = st.slider(
         "Min R/R",
-        1.0, 3.0, 1.5, 0.1,
+        1.0, 3.0, 2.0, 0.1,
         key="min_rr_input",
         disabled=is_same_locked_trade
     )
@@ -691,7 +692,7 @@ if managed["notes"]:
 # ----------------------------
 # LIVE P&L
 # ----------------------------
-st.subheader("Live Position P&L")
+st.subheader("Live P&L")
 pos = broker_position if broker_position else None
 if is_same_locked_trade and current_premium is not None:
     custom_pl = (float(current_premium) - float(st.session_state.active_trade["entry_premium"])) * int(st.session_state.active_trade["qty"]) * 100
@@ -764,7 +765,7 @@ if c2.button("Refresh data", use_container_width=True, key="bottom_refresh_btn")
 # ----------------------------
 # NEWS
 # ----------------------------
-st.subheader("Recent News")
+st.subheader("News")
 news = get_news(symbol, limit=8)
 if not news:
     st.write("No recent news returned.")
