@@ -31,6 +31,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
 import streamlit as st
+import yfinance as yf
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE CONFIG
@@ -204,6 +205,17 @@ def get_stock_bars(symbol:str,timeframe:str="5Min",limit:int=150)->pd.DataFrame:
     for col in ["Open","High","Low","Close","Volume"]:
         df[col]=pd.to_numeric(df[col],errors="coerce").astype("float64")
     return df[["Time","Open","High","Low","Close","Volume"]]
+
+
+@st.cache_data(ttl=120)
+def get_vix_spot()->Optional[float]:
+    try:
+        vix = yf.Ticker("^VIX").history(period="5d", interval="1d", auto_adjust=False)
+        if vix is None or vix.empty:
+            return None
+        return float(vix["Close"].dropna().iloc[-1])
+    except Exception:
+        return None
 
 @st.cache_data(ttl=60)
 def get_option_contracts(symbol:str,expiration_date:Optional[str],option_type:Optional[str])->list:
@@ -904,18 +916,6 @@ with st.sidebar:
     qty         =st.number_input("Contracts",min_value=1,max_value=100,value=10,step=1)
     order_style =st.selectbox("Order type",["market","limit"])
     st.divider()
-    st.subheader("Risk / Sizing")
-    account_size=st.number_input("Account size ($)",min_value=1000,max_value=10_000_000,value=25000,step=1000)
-    max_risk_pct=st.slider("Max risk per trade (%)",0.5,5.0,2.0,0.5)
-    max_risk_dollar=account_size*(max_risk_pct/100.0)
-    st.markdown(
-        f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;'
-        f'padding:10px 14px;margin:6px 0">'
-        f'<div style="color:#8b949e;font-size:.75rem;text-transform:uppercase;letter-spacing:.06em">Max Loss This Trade</div>'
-        f'<div style="color:#f87171;font-size:1.5rem;font-weight:900">${max_risk_dollar:,.0f}</div>'
-        f'<div style="color:#6b7280;font-size:.72rem">{max_risk_pct}% of ${account_size:,}</div>'
-        f'</div>',unsafe_allow_html=True)
-    st.divider()
     enable_multi_tf=st.checkbox("Multi-timeframe confirmation",value=True)
     show_auto_pick =st.checkbox("Show smart contract picker",value=True)
     min_dte=21; max_dte=45  # fixed defaults, no sliders needed
@@ -966,6 +966,10 @@ underlying_snapshot=get_stock_snapshot(symbol)
 last_trade =safe_get(underlying_snapshot,"latestTrade","p")
 daily_close=safe_get(underlying_snapshot,"dailyBar","c")
 prev_close =safe_get(underlying_snapshot,"prevDailyBar","c")
+current_rsi = None
+if not bars.empty and "RSI" in bars.columns and pd.notna(bars.iloc[-1].get("RSI")):
+    current_rsi = float(bars.iloc[-1]["RSI"])
+vix_spot = get_vix_spot()
 
 snapshot        =get_option_snapshot(contract_symbol) if contract_symbol else {}
 quote_bid       =safe_get(snapshot,"latestQuote","bp")
@@ -1026,12 +1030,14 @@ with cert_col:
 
 # ── Underlying ────────────────────────────────────────────────────────────────
 section("Underlying")
-u1,u2,u3,u4,u5=st.columns(5)
+u1,u2,u3,u4,u5,u6,u7=st.columns(7)
 u1.markdown(f'<div style="padding:4px 0">{bias_badge(stock_bias)}</div>',unsafe_allow_html=True)
 u2.metric("Score",stock_score)
 u3.metric("Latest Trade",fmt_money(last_trade))
-u4.metric("Daily / Prev",f"{fmt_money(daily_close)} / {fmt_money(prev_close)}")
-u5.metric("Session",session_name)
+u4.metric("RSI",fmt_num(current_rsi,1))
+u5.metric("VIX",fmt_num(vix_spot,2))
+u6.metric("Daily / Prev",f"{fmt_money(daily_close)} / {fmt_money(prev_close)}")
+u7.metric("Session",session_name)
 
 # ── Multi-TF confirmation ─────────────────────────────────────────────────────
 if tf_biases:
@@ -1132,30 +1138,6 @@ if show_auto_pick:
     st.divider()
 
 # ── Kelly Sizing ───────────────────────────────────────────────────────────────
-section("📐 Kelly Position Sizing")
-k1,k2,k3=st.columns(3)
-with k1:
-    hist_win_rate=st.slider("Historical win rate (%)",10,90,55,5,key="win_rate_sl")/100
-with k2:
-    hist_avg_win=st.slider("Avg win (%)",10,200,60,5,key="avg_win_sl")/100
-with k3:
-    hist_avg_loss=st.slider("Avg loss (%)",10,100,30,5,key="avg_loss_sl")/100
-
-premium_for_kelly=float(quote_ask) if quote_ask else (float(last_option_trade) if last_option_trade else 1.0)
-kelly=kelly_contracts(hist_win_rate,hist_avg_win,hist_avg_loss,account_size,premium_for_kelly,max_risk_pct)
-# Override max_loss to always reflect account_size * max_risk_pct
-kelly_max_loss=max_risk_dollar
-kelly_contracts_capped=max(1,int(kelly_max_loss/(premium_for_kelly*100))) if premium_for_kelly>0 else kelly["contracts"]
-kc1,kc2,kc3,kc4,kc5,kc6=st.columns(6)
-kc1.metric("Full Kelly %",  f"{kelly['full_kelly_pct']}%")
-kc2.metric("¼ Kelly %",     f"{kelly['quarter_kelly_pct']}%")
-kc3.metric("Contracts (Kelly)", kelly["contracts"])
-kc4.metric("Contracts (Risk Cap)", kelly_contracts_capped)
-kc5.metric("Total Cost",    fmt_money(kelly_contracts_capped*premium_for_kelly*100))
-kc6.metric("Max Loss",      f'${kelly_max_loss:,.0f}',delta=f"{max_risk_pct}% of ${account_size:,}",delta_color="off")
-st.caption(kelly["notes"])
-
-st.divider()
 
 # ── Trade State ────────────────────────────────────────────────────────────────
 section("Trade State")
@@ -1321,4 +1303,4 @@ if st.session_state.trade_history:
 with st.expander("More contract details"):
     st.json({"contract":selected_contract or {},"snapshot":snapshot or {}})
 
-st.caption("SPY Buddy Quant Edition · Research / education only · Not financial advice.")
+st.caption("SPY Buddy Quant Edition · Cleaner layout · Research / education only · Not financial advice.")
