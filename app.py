@@ -771,29 +771,29 @@ def make_chart(df:pd.DataFrame,symbol:str,breakeven:Optional[float]=None)->go.Fi
     fig.add_trace(go.Candlestick(
         x=cdf["Time"],open=cdf["Open"],high=cdf["High"],low=cdf["Low"],close=cdf["Close"],
         name=symbol,increasing_line_color="#00c864",increasing_fillcolor="#00c864",
-        decreasing_line_color="#ef4444",decreasing_fillcolor="#ef4444"),row=1,col=1,secondary_y=False)
+        decreasing_line_color="#ef4444",decreasing_fillcolor="#ef4444"),row=1,col=1,secondary_y=True)
 
     # ── EMAs ───────────────────────────────────────────────────────────────
     for col,color in _EMA_COLORS.items():
         if col in cdf.columns and cdf[col].notna().sum()>0:
             fig.add_trace(go.Scatter(x=cdf["Time"],y=cdf[col],mode="lines",name=col,
-                                     line=dict(color=color,width=1.5)),row=1,col=1,secondary_y=False)
+                                     line=dict(color=color,width=1.5),hoverinfo="skip",hovertemplate=None),row=1,col=1,secondary_y=True)
 
     # ── VWAP ───────────────────────────────────────────────────────────────
     if "VWAP" in cdf.columns and cdf["VWAP"].notna().sum()>0:
         fig.add_trace(go.Scatter(x=cdf["Time"],y=cdf["VWAP"],mode="lines",name="VWAP",
-                                  line=dict(color="#06b6d4",width=1.4,dash="dot")),row=1,col=1,secondary_y=False)
+                                  line=dict(color="#06b6d4",width=1.4,dash="dot"),hoverinfo="skip",hovertemplate=None),row=1,col=1,secondary_y=True)
 
     # ── Bollinger Bands ────────────────────────────────────────────────────
     if "BB_upper" in cdf.columns:
         for col,name in [("BB_upper","BB Upper"),("BB_lower","BB Lower")]:
             fig.add_trace(go.Scatter(x=cdf["Time"],y=cdf[col],mode="lines",name=name,
                                       line=dict(color="rgba(139,92,246,.4)",width=1,dash="dot"),
-                                      showlegend=False),row=1,col=1,secondary_y=False)
+                                      showlegend=False,hoverinfo="skip",hovertemplate=None),row=1,col=1,secondary_y=True)
 
     # ── Volume ─────────────────────────────────────────────────────────────
-    fig.add_trace(go.Bar(x=cdf["Time"],y=cdf["Volume"],name="Volume",marker_color=vol_colors),
-                  row=1,col=1,secondary_y=True)
+    fig.add_trace(go.Bar(x=cdf["Time"],y=cdf["Volume"],name="Volume",marker_color=vol_colors,hoverinfo="skip",hovertemplate=None),
+                  row=1,col=1,secondary_y=False)
 
     # ── Breakeven line ─────────────────────────────────────────────────────
     if breakeven is not None:
@@ -823,56 +823,54 @@ def make_chart(df:pd.DataFrame,symbol:str,breakeven:Optional[float]=None)->go.Fi
     # ── RSI + StochRSI ─────────────────────────────────────────────────────
     if has_rsi:
         fig.add_trace(go.Scatter(x=cdf["Time"],y=cdf["RSI"],mode="lines",name="RSI",
-                                  line=dict(color="#06b6d4",width=1.5)),row=rsi_row,col=1)
+                                  line=dict(color="#06b6d4",width=1.5),hoverinfo="skip",hovertemplate=None),row=rsi_row,col=1)
         if "StochRSI_K" in cdf.columns:
             fig.add_trace(go.Scatter(x=cdf["Time"],y=cdf["StochRSI_K"],mode="lines",name="StochRSI K",
-                                      line=dict(color="#f59e0b",width=1,dash="dot")),row=rsi_row,col=1)
+                                      line=dict(color="#f59e0b",width=1,dash="dot"),hoverinfo="skip",hovertemplate=None),row=rsi_row,col=1)
             fig.add_trace(go.Scatter(x=cdf["Time"],y=cdf["StochRSI_D"],mode="lines",name="StochRSI D",
-                                      line=dict(color="#a855f7",width=1,dash="dot")),row=rsi_row,col=1)
+                                      line=dict(color="#a855f7",width=1,dash="dot"),hoverinfo="skip",hovertemplate=None),row=rsi_row,col=1)
         for lvl,clr in [(70,"rgba(239,68,68,.35)"),(50,"rgba(255,255,255,.12)"),(30,"rgba(0,200,100,.35)")]:
             fig.add_hline(y=lvl,row=rsi_row,col=1,line_dash="dot",line_color=clr,line_width=1)
 
     # ── MACD ───────────────────────────────────────────────────────────────
     if has_macd:
         hist_colors=["rgba(0,200,100,.6)" if v>=0 else "rgba(239,68,68,.6)" for v in cdf["MACD_hist"].fillna(0)]
-        fig.add_trace(go.Bar(x=cdf["Time"],y=cdf["MACD_hist"],name="MACD Hist",marker_color=hist_colors),
+        fig.add_trace(go.Bar(x=cdf["Time"],y=cdf["MACD_hist"],name="MACD Hist",marker_color=hist_colors,hoverinfo="skip",hovertemplate=None),
                       row=macd_row,col=1)
         fig.add_trace(go.Scatter(x=cdf["Time"],y=cdf["MACD"],mode="lines",name="MACD",
-                                  line=dict(color="#3b82f6",width=1.4)),row=macd_row,col=1)
+                                  line=dict(color="#3b82f6",width=1.4),hoverinfo="skip",hovertemplate=None),row=macd_row,col=1)
         fig.add_trace(go.Scatter(x=cdf["Time"],y=cdf["MACD_signal"],mode="lines",name="Signal",
-                                  line=dict(color="#f87171",width=1.4)),row=macd_row,col=1)
+                                  line=dict(color="#f87171",width=1.4),hoverinfo="skip",hovertemplate=None),row=macd_row,col=1)
 
     # ── TTM Squeeze histogram ──────────────────────────────────────────────
     if has_squeeze:
         sq_colors=["rgba(0,200,100,.6)" if v>=0 else "rgba(239,68,68,.6)" for v in cdf["Squeeze_hist"].fillna(0)]
-        fig.add_trace(go.Bar(x=cdf["Time"],y=cdf["Squeeze_hist"],name="Squeeze",marker_color=sq_colors),
+        fig.add_trace(go.Bar(x=cdf["Time"],y=cdf["Squeeze_hist"],name="Squeeze",marker_color=sq_colors,hoverinfo="skip",hovertemplate=None),
                       row=sq_row,col=1)
         # Squeeze dots
         sq_on=cdf[cdf["Squeeze_ON"]==True]
         sq_off=cdf[cdf["Squeeze_ON"]==False]
         if not sq_on.empty:
             fig.add_trace(go.Scatter(x=sq_on["Time"],y=[0]*len(sq_on),mode="markers",name="Squeeze ON",
-                                      marker=dict(color="#ef4444",size=5,symbol="circle")),row=sq_row,col=1)
+                                      marker=dict(color="#ef4444",size=5,symbol="circle"),hoverinfo="skip",hovertemplate=None),row=sq_row,col=1)
         if not sq_off.empty:
             fig.add_trace(go.Scatter(x=sq_off["Time"],y=[0]*len(sq_off),mode="markers",name="Squeeze OFF",
-                                      marker=dict(color="#4ade80",size=5,symbol="circle")),row=sq_row,col=1)
+                                      marker=dict(color="#4ade80",size=5,symbol="circle"),hoverinfo="skip",hovertemplate=None),row=sq_row,col=1)
 
     # ── Layout ─────────────────────────────────────────────────────────────
     fig.update_layout(
         paper_bgcolor="#0d1117",plot_bgcolor="#0d1117",
         font=dict(color="#c9d1d9",family="monospace"),
         height=680,xaxis_rangeslider_visible=False,dragmode="pan",
-        hovermode="x unified",
-        hoverlabel=dict(bgcolor="#161b22",bordercolor="#30363d",font_color="#e6edf3"),
+        hovermode=False,
         legend=dict(orientation="h",bgcolor="rgba(13,17,23,.85)",bordercolor="#30363d",
                     borderwidth=1,font=dict(size=10),y=-0.05),
         margin=dict(l=60,r=80,t=40,b=60),
     )
     fig.update_xaxes(showspikes=True,spikemode="across",spikecolor="#58a6ff",
                      spikedash="dot",spikethickness=1,**_grid)
-    fig.update_yaxes(title_text="Price",side="left",fixedrange=True,**_grid,row=1,col=1,secondary_y=False)
-    fig.update_yaxes(title_text="Vol",side="right",fixedrange=True,showgrid=False,
-                     range=[0,cdf["Volume"].max()*4],row=1,col=1,secondary_y=True)
+    fig.update_yaxes(title_text="Volume",side="left",fixedrange=True,showgrid=False,row=1,col=1,secondary_y=False)
+    fig.update_yaxes(title_text="Price",side="right",fixedrange=False,**_grid,row=1,col=1,secondary_y=True)
     if has_rsi:    fig.update_yaxes(title_text="RSI",fixedrange=True,range=[0,100],**_grid,row=rsi_row,col=1)
     if has_macd:   fig.update_yaxes(title_text="MACD",fixedrange=True,**_grid,row=macd_row,col=1)
     if has_squeeze:fig.update_yaxes(title_text="Squeeze",fixedrange=True,**_grid,row=sq_row,col=1)
@@ -1290,8 +1288,7 @@ st.divider()
 section("Underlying Chart")
 if not bars.empty:
     st.plotly_chart(make_chart(bars,symbol,breakeven_price),use_container_width=True,
-                    config={"scrollZoom":True,"displaylogo":False,
-                            "modeBarButtonsToRemove":["select2d","lasso2d"]})
+                    config={"scrollZoom":True,"displaylogo":False,"displayModeBar":False})
     st.caption("Scroll = zoom time axis · Click-drag = pan · Double-click = reset")
 else:
     st.info("No underlying chart data returned.")
