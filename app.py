@@ -1,6 +1,7 @@
 """
 SPY Buddy Options — Quant Edition
 ==================================
+Data: Tradier API (real-time, no delay)
 Chart: Plotly multi-panel (candlestick + volume + RSI/StochRSI + MACD + Squeeze)
 Signals: prev_state tracked inside loop — no duplicates, no stacking.
 TDA: 1H/4H/Daily use EMA 21/50/200.
@@ -85,13 +86,13 @@ small, .stCaption, [data-testid="stCaptionContainer"] { color:#8b949e!important;
 """, unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CREDENTIALS
+# CREDENTIALS  (Tradier)
 # ══════════════════════════════════════════════════════════════════════════════
-ALPACA_KEY    = st.secrets.get("ALPACA_API_KEY",    "")
-ALPACA_SECRET = st.secrets.get("ALPACA_SECRET_KEY", "")
-PAPER_BASE    = "https://paper-api.alpaca.markets"
-DATA_BASE     = "https://data.alpaca.markets"
-DEFAULT_SYMBOL = "SPY"
+TRADIER_TOKEN      = st.secrets.get("TRADIER_TOKEN", "")
+TRADIER_ACCOUNT_ID = st.secrets.get("TRADIER_ACCOUNT_ID", "")
+# Use sandbox for paper trading, live for real-time data
+TRADIER_BASE       = "https://api.tradier.com"
+DEFAULT_SYMBOL     = "SPY"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # COLOUR / BADGE HELPERS
@@ -135,17 +136,26 @@ def section(title:str):
                 f'text-transform:uppercase;letter-spacing:.1em">{title}</h3>',unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# API HELPERS
+# TRADIER API HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
-def headers()->Dict[str,str]:
-    return {"APCA-API-KEY-ID":ALPACA_KEY,"APCA-API-SECRET-KEY":ALPACA_SECRET,"accept":"application/json"}
+def _tradier_headers()->Dict[str,str]:
+    return {
+        "Authorization": f"Bearer {TRADIER_TOKEN}",
+        "Accept": "application/json",
+    }
 
-def api_get(url:str,params:Optional[dict]=None)->dict:
-    r=requests.get(url,headers=headers(),params=params,timeout=20); r.raise_for_status(); return r.json()
+def _tradier_get(path:str, params:Optional[dict]=None)->dict:
+    url = f"{TRADIER_BASE}{path}"
+    r = requests.get(url, headers=_tradier_headers(), params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
 
-def api_post(url:str,payload:dict)->dict:
-    r=requests.post(url,headers={**headers(),"content-type":"application/json"},json=payload,timeout=20)
-    r.raise_for_status(); return r.json()
+def _tradier_post(path:str, data:dict)->dict:
+    url = f"{TRADIER_BASE}{path}"
+    r = requests.post(url, headers={**_tradier_headers(), "Content-Type":"application/x-www-form-urlencoded"},
+                      data=data, timeout=20)
+    r.raise_for_status()
+    return r.json()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FORMATTERS
@@ -191,25 +201,118 @@ def active_trade_matches(contract_symbol:Optional[str])->bool:
     return bool(t and contract_symbol and t.get("contract_symbol")==contract_symbol)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ALPACA DATA
+# TRADIER DATA FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ── Timeframe mapping ──────────────────────────────────────────────────────────
+# Tradier has two bar endpoints:
+#   timesales: 1min, 5min, 15min  (intraday, up to 40 days)
+#   history:   daily, weekly, monthly
+# For 1Hour and 4Hour we fetch 5min bars and resample.
+_TF_MAP = {
+    "1Min":  ("timesales", "1min"),
+    "5Min":  ("timesales", "5min"),
+    "15Min": ("timesales", "15min"),
+    "1Hour": ("timesales", "5min"),   # resample 5min → 1H
+    "4Hour": ("timesales", "5min"),   # resample 5min → 4H
+    "1Day":  ("history",   "daily"),
+    "1Week": ("history",   "weekly"),
+}
+
 @st.cache_data(ttl=20)
-def get_stock_snapshot(symbol:str)->dict:
-    return api_get(f"{DATA_BASE}/v2/stocks/{symbol}/snapshot")
+def get_stock_quote(symbol:str)->dict:
+    """Real-time quote for a single symbol. Returns the quote dict."""
+    try:
+        data = _tradier_get("/v1/markets/quotes", params={"symbols": symbol.upper(), "greeks": "false"})
+        q = safe_get(data, "quotes", "quote", default={})
+        # When multiple symbols, Tradier returns a list; handle both cases
+        if isinstance(q, list):
+            q = next((x for x in q if x.get("symbol","").upper()==symbol.upper()), {})
+        return q or {}
+    except: return {}
 
 @st.cache_data(ttl=30)
-def get_stock_bars(symbol:str,timeframe:str="5Min",limit:int=200)->pd.DataFrame:
-    payload=api_get(f"{DATA_BASE}/v2/stocks/bars",params={
-        "symbols":symbol.upper(),"timeframe":timeframe,"limit":limit,
-        "adjustment":"raw","feed":"iex","sort":"asc"})
-    bars=payload.get("bars",{}).get(symbol.upper(),[])
-    if not bars: return pd.DataFrame()
-    df=pd.DataFrame(bars)
-    df["Time"]=pd.to_datetime(df["t"],utc=True).dt.tz_convert("America/New_York")
-    df=df.rename(columns={"o":"Open","h":"High","l":"Low","c":"Close","v":"Volume"})
-    for col in ["Open","High","Low","Close","Volume"]:
-        df[col]=pd.to_numeric(df[col],errors="coerce").astype("float64")
-    return df[["Time","Open","High","Low","Close","Volume"]]
+def get_stock_bars(symbol:str, timeframe:str="5Min", limit:int=200)->pd.DataFrame:
+    """
+    Fetch OHLCV bars from Tradier.
+    Handles timesales (intraday) and history (daily/weekly).
+    For 1Hour and 4Hour, fetches 5min bars and resamples.
+    """
+    endpoint, interval = _TF_MAP.get(timeframe, ("timesales", "5min"))
+    resample_rule = None
+    if timeframe == "1Hour":  resample_rule = "1h"
+    if timeframe == "4Hour":  resample_rule = "4h"
+
+    try:
+        if endpoint == "timesales":
+            # Calculate start/end to get enough bars
+            # 5min bars: need limit * 5 minutes of data
+            # Add extra days to account for weekends/holidays
+            minutes_needed = limit * (5 if interval == "5min" else (1 if interval == "1min" else 15))
+            if resample_rule:
+                # For resampling, fetch more raw bars
+                minutes_needed = limit * (60 if timeframe=="1Hour" else 240) + 1440
+            days_needed = max(5, math.ceil(minutes_needed / 390) + 3)  # 390 min/trading day
+            end_dt   = dt.datetime.now()
+            start_dt = end_dt - dt.timedelta(days=days_needed)
+            params = {
+                "symbol":   symbol.upper(),
+                "interval": interval,
+                "start":    start_dt.strftime("%Y-%m-%d %H:%M"),
+                "end":      end_dt.strftime("%Y-%m-%d %H:%M"),
+                "session_filter": "open",
+            }
+            data = _tradier_get("/v1/markets/timesales", params=params)
+            raw = safe_get(data, "series", "data", default=[])
+            if not raw: return pd.DataFrame()
+            if isinstance(raw, dict): raw = [raw]  # single bar edge case
+
+            df = pd.DataFrame(raw)
+            df["Time"] = pd.to_datetime(df["time"], format="%Y-%m-%d %H:%M:%S")
+            df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
+            for col in ["Open","High","Low","Close","Volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+            df = df[["Time","Open","High","Low","Close","Volume"]].sort_values("Time").reset_index(drop=True)
+
+            # Resample to 1H or 4H if needed
+            if resample_rule:
+                df = df.set_index("Time")
+                df = df.resample(resample_rule, label="left", closed="left").agg(
+                    Open=("Open","first"), High=("High","max"),
+                    Low=("Low","min"),   Close=("Close","last"),
+                    Volume=("Volume","sum")
+                ).dropna(subset=["Open","Close"]).reset_index()
+                df = df.rename(columns={"Time":"Time"})
+
+            # Return last `limit` bars
+            return df.tail(limit).reset_index(drop=True)
+
+        else:  # history endpoint (daily / weekly)
+            days_needed = limit * (7 if interval=="weekly" else 1) + 30
+            end_dt   = dt.date.today()
+            start_dt = end_dt - dt.timedelta(days=days_needed)
+            params = {
+                "symbol":   symbol.upper(),
+                "interval": interval,
+                "start":    start_dt.strftime("%Y-%m-%d"),
+                "end":      end_dt.strftime("%Y-%m-%d"),
+            }
+            data = _tradier_get("/v1/markets/history", params=params)
+            raw = safe_get(data, "history", "day", default=[])
+            if not raw: return pd.DataFrame()
+            if isinstance(raw, dict): raw = [raw]
+
+            df = pd.DataFrame(raw)
+            df["Time"] = pd.to_datetime(df["date"])
+            df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
+            for col in ["Open","High","Low","Close","Volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+            df = df[["Time","Open","High","Low","Close","Volume"]].sort_values("Time").reset_index(drop=True)
+            return df.tail(limit).reset_index(drop=True)
+
+    except Exception as e:
+        st.warning(f"Bar data error ({symbol} {timeframe}): {e}")
+        return pd.DataFrame()
 
 @st.cache_data(ttl=120)
 def get_vix_spot()->Optional[float]:
@@ -220,25 +323,43 @@ def get_vix_spot()->Optional[float]:
     except: return None
 
 @st.cache_data(ttl=60)
-def get_option_contracts(symbol:str,expiration_date:Optional[str],option_type:Optional[str])->list:
-    params={"underlying_symbols":symbol.upper(),"status":"active","limit":1000}
-    if expiration_date: params["expiration_date"]=expiration_date
-    if option_type:     params["type"]=option_type.lower()
-    payload=api_get(f"{PAPER_BASE}/v2/options/contracts",params=params)
-    return payload.get("option_contracts",[])
-
-@st.cache_data(ttl=20)
-def get_option_snapshot(contract_symbol:str)->dict:
-    payload=api_get(f"{DATA_BASE}/v1beta1/options/snapshots",params={"symbols":contract_symbol})
-    return payload.get("snapshots",{}).get(contract_symbol,{})
+def get_option_expirations(symbol:str)->List[str]:
+    """Fetch all available expiration dates for a symbol."""
+    try:
+        data = _tradier_get("/v1/markets/options/expirations",
+                            params={"symbol": symbol.upper(), "includeAllRoots": "true"})
+        exps = safe_get(data, "expirations", "date", default=[])
+        if isinstance(exps, str): exps = [exps]
+        return sorted(exps) if exps else []
+    except: return []
 
 @st.cache_data(ttl=30)
-def get_news(symbols:str,limit:int=8)->list:
-    payload=api_get(f"{DATA_BASE}/v1beta1/news",params={"symbols":symbols,"limit":limit,"sort":"desc"})
-    return payload.get("news",[])
+def get_option_chain(symbol:str, expiration:str, option_type:Optional[str]=None)->List[dict]:
+    """
+    Fetch full options chain for a given expiration with greeks.
+    Returns a list of option contract dicts — each has bid, ask, greeks, IV, OI, etc.
+    """
+    try:
+        data = _tradier_get("/v1/markets/options/chains",
+                            params={"symbol": symbol.upper(),
+                                    "expiration": expiration,
+                                    "greeks": "true"})
+        contracts = safe_get(data, "options", "option", default=[])
+        if not contracts: return []
+        if isinstance(contracts, dict): contracts = [contracts]
+        if option_type:
+            contracts = [c for c in contracts if c.get("option_type","").lower() == option_type.lower()]
+        return contracts
+    except: return []
 
 def get_open_positions()->list:
-    try: return api_get(f"{PAPER_BASE}/v2/positions")
+    """Fetch open positions from Tradier brokerage account."""
+    if not TRADIER_ACCOUNT_ID: return []
+    try:
+        data = _tradier_get(f"/v1/accounts/{TRADIER_ACCOUNT_ID}/positions")
+        pos = safe_get(data, "positions", "position", default=[])
+        if isinstance(pos, dict): pos = [pos]
+        return pos or []
     except: return []
 
 def find_position(symbol:str)->Optional[dict]:
@@ -246,10 +367,37 @@ def find_position(symbol:str)->Optional[dict]:
         if p.get("symbol")==symbol: return p
     return None
 
-def place_option_order(symbol:str,qty:int,side:str,order_type:str="market",limit_price:Optional[float]=None)->dict:
-    payload:Dict[str,Any]={"symbol":symbol,"qty":str(qty),"side":side,"type":order_type,"time_in_force":"day"}
-    if order_type=="limit" and limit_price is not None: payload["limit_price"]=str(limit_price)
-    return api_post(f"{PAPER_BASE}/v2/orders",payload)
+def place_option_order(option_symbol:str, qty:int, side:str,
+                       order_type:str="market", limit_price:Optional[float]=None)->dict:
+    """
+    Place an option order via Tradier.
+    side: 'buy_to_open' | 'buy_to_close' | 'sell_to_open' | 'sell_to_close'
+    """
+    if not TRADIER_ACCOUNT_ID:
+        raise ValueError("TRADIER_ACCOUNT_ID not set in secrets.")
+    data: Dict[str,Any] = {
+        "class":         "option",
+        "symbol":        option_symbol,   # OCC option symbol e.g. SPY240419C00530000
+        "option_symbol": option_symbol,
+        "quantity":      str(qty),
+        "side":          side,
+        "type":          order_type,
+        "duration":      "day",
+        "preview":       "false",
+    }
+    if order_type == "limit" and limit_price is not None:
+        data["price"] = str(round(limit_price, 2))
+    result = _tradier_post(f"/v1/accounts/{TRADIER_ACCOUNT_ID}/orders", data)
+    return result.get("order", result)
+
+@st.cache_data(ttl=60)
+def get_news(symbol:str, limit:int=8)->list:
+    """Fetch news via yfinance as Tradier doesn't have a news endpoint."""
+    try:
+        ticker = yf.Ticker(symbol)
+        news = ticker.news or []
+        return news[:limit]
+    except: return []
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INDICATOR ENGINE
@@ -268,12 +416,10 @@ def add_indicators(df:pd.DataFrame, htf:bool=False)->pd.DataFrame:
     if out.empty or len(out)<10: return out
 
     if htf:
-        # Higher timeframe: 21 / 50 / 200 EMA
         out["EMA_21"] =out["Close"].ewm(span=21, adjust=False).mean()
         out["EMA_50"] =out["Close"].ewm(span=50, adjust=False).mean()
         out["EMA_200"]=out["Close"].ewm(span=200,adjust=False).mean()
-        # Alias so stock_signal can still reference EMA_8 → use EMA_21 as proxy
-        out["EMA_8"]=out["EMA_21"]
+        out["EMA_8"]=out["EMA_21"]  # alias for state machine
     else:
         out["EMA_8"] =out["Close"].ewm(span=8, adjust=False).mean()
         out["EMA_21"]=out["Close"].ewm(span=21,adjust=False).mean()
@@ -447,17 +593,13 @@ def stock_signal(df:pd.DataFrame)->Tuple[str,int,List[str],int]:
     return bias,score,reasons,certainty_pct
 
 def stock_signal_htf(df:pd.DataFrame)->Tuple[str,int,List[str],int]:
-    """
-    Higher-timeframe signal using EMA 21/50/200.
-    Used for 1H, 4H, Daily TDA cards.
-    """
+    """Higher-timeframe signal using EMA 21/50/200. Used for 1H, 4H, Daily TDA cards."""
     if df.empty or len(df)<30:
         return "NEUTRAL",0,["Not enough bar data."],0
 
     row=df.iloc[-1]
     score=0; reasons=[]; certainty_points=0; certainty_max=0
 
-    # EMA 21 / 50 / 200 structure
     certainty_max+=3
     if pd.notna(row.get("EMA_21")) and row["Close"]>row["EMA_21"]:
         score+=1; certainty_points+=1; reasons.append("✅ Price above EMA 21.")
@@ -472,7 +614,6 @@ def stock_signal_htf(df:pd.DataFrame)->Tuple[str,int,List[str],int]:
     else:
         score-=1; reasons.append("❌ EMA 50 below EMA 200 — long-term bear.")
 
-    # Price vs EMA 200
     certainty_max+=1
     if pd.notna(row.get("EMA_200")):
         if row["Close"]>row["EMA_200"]:
@@ -539,7 +680,7 @@ def expected_move(price:float,iv:float,dte:int)->Tuple[float,float]:
 # ══════════════════════════════════════════════════════════════════════════════
 # MULTI-TIMEFRAME SIGNAL
 # ══════════════════════════════════════════════════════════════════════════════
-_TF_LIMITS = {"1Min":200,"5Min":200,"15Min":150,"1Hour":120,"1Day":100,"1Week":80}
+_TF_LIMITS = {"1Min":200,"5Min":200,"15Min":150,"1Hour":120,"4Hour":80,"1Day":100,"1Week":80}
 
 @st.cache_data(ttl=60)
 def _get_tf_bias(symbol:str,tf:str)->Tuple[str,int,List[str],int]:
@@ -579,12 +720,11 @@ def multi_tf_signal(symbol:str,primary_tf:str)->Tuple[str,int,List[str],int,Dict
 # ══════════════════════════════════════════════════════════════════════════════
 # TOP-DOWN ANALYSIS  (W / D / 4H / 1H / 15min / 5min)
 # ══════════════════════════════════════════════════════════════════════════════
-# label, alpaca_tf, limit, use_htf_emas, purpose
 _TDA_TIMEFRAMES = [
     ("Weekly",  "1Week",  80,  False, "Macro trend — big-picture direction."),
     ("Daily",   "1Day",   120, True,  "Intermediate trend — swing direction. EMA 21/50/200."),
-    ("4-Hour",  "4Hour",  120, True,  "Short-term trend — intraday swing bias. EMA 21/50/200."),
-    ("1-Hour",  "1Hour",  150, True,  "Intraday momentum — entry zone. EMA 21/50/200."),
+    ("4-Hour",  "4Hour",  80,  True,  "Short-term trend — intraday swing bias. EMA 21/50/200."),
+    ("1-Hour",  "1Hour",  120, True,  "Intraday momentum — entry zone. EMA 21/50/200."),
     ("15-Min",  "15Min",  150, False, "Execution context — is momentum aligned?"),
     ("5-Min",   "5Min",   200, False, "Entry trigger — fine-tune entry timing."),
 ]
@@ -763,31 +903,12 @@ def contract_quality(underlying_price,strike,bid,ask,volume,open_interest,iv,del
 # ══════════════════════════════════════════════════════════════════════════════
 # IV RANK + PUT/CALL RATIO
 # ══════════════════════════════════════════════════════════════════════════════
-def compute_iv_rank(contracts_raw:list,current_iv:Optional[float])->Tuple[Optional[float],str]:
-    if not contracts_raw or current_iv is None: return None,"N/A"
-    ivs=[]
-    for c in contracts_raw[:200]:
-        sym=c.get("symbol")
-        if not sym: continue
-        try:
-            snap=get_option_snapshot(sym)
-            iv_val=safe_get(snap,"implied_volatility")
-            if iv_val and float(iv_val)>0: ivs.append(float(iv_val))
-        except: pass
-    if len(ivs)<5: return None,"N/A"
-    iv_min=min(ivs); iv_max=max(ivs)
-    if iv_max==iv_min: return 50,"MEDIUM"
-    rank=int((float(current_iv)-iv_min)/(iv_max-iv_min)*100)
-    rank=max(0,min(100,rank))
-    label="LOW (cheap — good to buy)" if rank<30 else ("HIGH (expensive — avoid buying)" if rank>70 else "MEDIUM")
-    return rank,label
-
 def compute_put_call_ratio(contracts_raw:list)->Tuple[Optional[float],str]:
     call_oi=put_oi=0
     for c in contracts_raw:
         oi=c.get("open_interest") or 0
-        if c.get("type","").lower()=="call": call_oi+=float(oi)
-        elif c.get("type","").lower()=="put":  put_oi+=float(oi)
+        if c.get("option_type","").lower()=="call": call_oi+=float(oi)
+        elif c.get("option_type","").lower()=="put":  put_oi+=float(oi)
     if call_oi==0: return None,"N/A"
     pcr=put_oi/call_oi
     if pcr<0.7:   sentiment="Bullish (more calls)"
@@ -808,23 +929,21 @@ def auto_pick_contract(contracts_raw:list,option_type:str,underlying_price:Optio
         try: dte=(dt.date.fromisoformat(exp)-today).days
         except: continue
         if not (min_dte<=dte<=max_dte): continue
-        sym=c.get("symbol")
-        if not sym: continue
-        try:
-            snap=get_option_snapshot(sym)
-            delta=safe_get(snap,"greeks","delta")
-            bid=safe_get(snap,"latestQuote","bp")
-            ask=safe_get(snap,"latestQuote","ap")
-            oi=c.get("open_interest") or 0
-            if delta is None or bid is None or ask is None: continue
-            delta_abs=abs(float(delta))
-            if not (0.35<=delta_abs<=0.60): continue
-            if float(oi)<100: continue
-            spread_pct=(float(ask)-float(bid))/float(ask) if float(ask)>0 else 1
-            if spread_pct>0.20: continue
-            candidates.append({**c,"_delta":float(delta),"_bid":float(bid),"_ask":float(ask),
-                                "_dte":dte,"_spread_pct":spread_pct,"_snap":snap})
-        except: continue
+        if c.get("option_type","").lower() != option_type.lower(): continue
+        # Tradier chain already has bid/ask/greeks in the same object
+        bid   = c.get("bid")
+        ask   = c.get("ask")
+        greeks= c.get("greeks") or {}
+        delta = greeks.get("delta")
+        oi    = c.get("open_interest") or 0
+        if delta is None or bid is None or ask is None: continue
+        delta_abs=abs(float(delta))
+        if not (0.35<=delta_abs<=0.60): continue
+        if float(oi)<100: continue
+        spread_pct=(float(ask)-float(bid))/float(ask) if float(ask)>0 else 1
+        if spread_pct>0.20: continue
+        candidates.append({**c,"_delta":float(delta),"_bid":float(bid),"_ask":float(ask),
+                            "_dte":dte,"_spread_pct":spread_pct})
     if not candidates: return None
     candidates.sort(key=lambda x:(abs(abs(x["_delta"])-0.50),x["_spread_pct"]))
     return candidates[0]
@@ -886,13 +1005,14 @@ def _plotly_layout(fig:go.Figure, rows:int, height:int=820):
             font=dict(size=10),
             x=0.01, y=0.99,
         ),
-        hovermode="x unified",
+        # ── Anti-glitch settings ──────────────────────────────────────────
+        uirevision="chart_stable",
+        hovermode="x",
         dragmode="pan",
         xaxis_rangeslider_visible=False,
+        autosize=True,
     )
     for i in range(1, rows+1):
-        xref = "x" if i==1 else f"x{i}"
-        yref = "y" if i==1 else f"y{i}"
         fig.update_xaxes(
             gridcolor=_CHART_GRID, gridwidth=1,
             zeroline=False, linecolor=_CHART_AXIS,
@@ -919,42 +1039,33 @@ def make_chart(df:pd.DataFrame, symbol:str, breakeven:Optional[float]=None):
 
     cdf = df.copy()
     cdf["Time"] = pd.to_datetime(cdf["Time"], errors="coerce")
-    # Strip timezone for Plotly (it handles tz-naive datetimes cleanly)
     if cdf["Time"].dt.tz is not None:
         cdf["Time"] = cdf["Time"].dt.tz_convert("America/New_York").dt.tz_localize(None)
-    cdf = cdf.dropna(subset=["Time"]).sort_values("Time").tail(200).reset_index(drop=True)
-    if cdf.empty:
-        st.info("No chart data after cleaning.")
-        return
 
-    has_rsi     = "RSI"          in cdf.columns and cdf["RSI"].notna().sum() > 5
-    has_macd    = "MACD"         in cdf.columns and cdf["MACD"].notna().sum() > 5
-    has_squeeze = "Squeeze_hist" in cdf.columns and cdf["Squeeze_hist"].notna().sum() > 5
-    has_vwap    = "VWAP"         in cdf.columns and cdf["VWAP"].notna().sum() > 5
-    has_bb      = "BB_upper"     in cdf.columns and cdf["BB_upper"].notna().sum() > 5
+    has_vwap    = "VWAP"        in cdf.columns and cdf["VWAP"].notna().sum()>0
+    has_bb      = "BB_upper"    in cdf.columns and cdf["BB_upper"].notna().sum()>0
+    has_rsi     = "RSI"         in cdf.columns and cdf["RSI"].notna().sum()>0
+    has_macd    = "MACD"        in cdf.columns and cdf["MACD"].notna().sum()>0
+    has_squeeze = "Squeeze_hist"in cdf.columns and cdf["Squeeze_hist"].notna().sum()>0
+    has_volume  = "Volume"      in cdf.columns and cdf["Volume"].notna().sum()>0
 
-    # Decide row layout
-    row_specs   = [[{"type":"candlestick"}]]
+    # Count sub-panels
+    n_rows = 1
     row_heights = [0.50]
-    if cdf["Volume"].notna().sum() > 0:
-        row_specs.append([{"type":"bar"}]);    row_heights.append(0.10)
-    if has_rsi:
-        row_specs.append([{"type":"scatter"}]); row_heights.append(0.14)
-    if has_macd:
-        row_specs.append([{"type":"scatter"}]); row_heights.append(0.14)
-    if has_squeeze:
-        row_specs.append([{"type":"bar"}]);    row_heights.append(0.12)
+    if has_volume:  n_rows+=1; row_heights.append(0.10)
+    if has_rsi:     n_rows+=1; row_heights.append(0.14)
+    if has_macd:    n_rows+=1; row_heights.append(0.14)
+    if has_squeeze: n_rows+=1; row_heights.append(0.12)
+    total = sum(row_heights)
+    row_heights = [h/total for h in row_heights]
 
-    n_rows = len(row_specs)
     fig = make_subplots(
-        rows=n_rows, cols=1,
-        shared_xaxes=True,
+        rows=n_rows, cols=1, shared_xaxes=True,
         vertical_spacing=0.02,
         row_heights=row_heights,
-        specs=row_specs,
     )
 
-    # ── Row 1: Candlesticks ────────────────────────────────────────────────
+    # ── Row 1: Candlestick ────────────────────────────────────────────────
     fig.add_trace(go.Candlestick(
         x=cdf["Time"],
         open=cdf["Open"], high=cdf["High"],
@@ -1009,19 +1120,18 @@ def make_chart(df:pd.DataFrame, symbol:str, breakeven:Optional[float]=None):
     if breakeven is not None:
         fig.add_hline(
             y=float(breakeven), row=1, col=1,
-            line=dict(color="#f59e0b", width=1.5, dash="dash"),
+            line=dict(color="#ef4444", width=1.5, dash="dash"),
             annotation_text=f"BE ${breakeven:.2f}",
-            annotation_font_color="#f59e0b",
-            annotation_position="right",
+            annotation_font=dict(color="#ef4444", size=10),
         )
 
-    # Signal markers
+    # ── Signal markers ────────────────────────────────────────────────────
     buy_df, sell_df, exit_buy_df, exit_sell_df = find_chart_signals(cdf)
     if not buy_df.empty:
         fig.add_trace(go.Scatter(
             x=buy_df["time"], y=buy_df["low"] * 0.9985,
             mode="markers+text",
-            marker=dict(symbol="triangle-up", size=14, color="#00c864",
+            marker=dict(symbol="triangle-up", size=12, color="#00c864",
                         line=dict(color="#00c864", width=1)),
             text=[f"BUY<br>{v:.2f}" for v in buy_df["close"]],
             textposition="bottom center",
@@ -1034,7 +1144,7 @@ def make_chart(df:pd.DataFrame, symbol:str, breakeven:Optional[float]=None):
         fig.add_trace(go.Scatter(
             x=sell_df["time"], y=sell_df["high"] * 1.0015,
             mode="markers+text",
-            marker=dict(symbol="triangle-down", size=14, color="#ef4444",
+            marker=dict(symbol="triangle-down", size=12, color="#ef4444",
                         line=dict(color="#ef4444", width=1)),
             text=[f"SELL<br>{v:.2f}" for v in sell_df["close"]],
             textposition="top center",
@@ -1073,7 +1183,7 @@ def make_chart(df:pd.DataFrame, symbol:str, breakeven:Optional[float]=None):
     current_row = 2
 
     # ── Row 2: Volume ──────────────────────────────────────────────────────
-    if cdf["Volume"].notna().sum() > 0:
+    if has_volume:
         vol_colors = ["rgba(0,200,100,0.4)" if c >= o else "rgba(239,68,68,0.4)"
                       for c, o in zip(cdf["Close"], cdf["Open"])]
         fig.add_trace(go.Bar(
@@ -1108,7 +1218,6 @@ def make_chart(df:pd.DataFrame, symbol:str, breakeven:Optional[float]=None):
                 line=dict(color="#a855f7", width=1, dash="dot"),
                 hovertemplate="D: %{y:.1f}<extra></extra>",
             ), row=current_row, col=1)
-        # OB/OS reference lines
         for level, color in [(70, "rgba(239,68,68,0.3)"), (30, "rgba(74,222,128,0.3)"),
                              (50, "rgba(139,148,158,0.2)")]:
             fig.add_hline(y=level, row=current_row, col=1,
@@ -1149,7 +1258,6 @@ def make_chart(df:pd.DataFrame, symbol:str, breakeven:Optional[float]=None):
     if has_squeeze:
         sq = cdf["Squeeze_hist"].fillna(0)
         sq_colors = ["rgba(0,200,100,0.7)" if v >= 0 else "rgba(239,68,68,0.7)" for v in sq]
-        # Squeeze dots on zero line (red = squeeze ON, green = squeeze OFF)
         sq_dot_colors = []
         if "Squeeze_ON" in cdf.columns:
             sq_dot_colors = ["#ef4444" if v else "#00c864"
@@ -1175,25 +1283,46 @@ def make_chart(df:pd.DataFrame, symbol:str, breakeven:Optional[float]=None):
 
     # ── Apply theme ────────────────────────────────────────────────────────
     _plotly_layout(fig, n_rows, height=860)
-    # Hide x-axis labels on all rows except the last
     for i in range(1, n_rows):
         fig.update_xaxes(showticklabels=False, row=i, col=1)
     fig.update_xaxes(showticklabels=True, row=n_rows, col=1)
-    # Remove rangeslider from candlestick
-    fig.update_layout(xaxis_rangeslider_visible=False)
+    fig.update_layout(
+        xaxis_rangeslider_visible=False,
+        transition=dict(duration=0, easing="linear"),
+        xaxis=dict(matches="x"),
+    )
 
-    st.plotly_chart(fig, use_container_width=True, config={
-        "scrollZoom": True,
-        "displayModeBar": True,
-        "modeBarButtonsToRemove": ["autoScale2d","lasso2d","select2d"],
-        "displaylogo": False,
-    })
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        key="main_price_chart",
+        config={
+            "scrollZoom": True,
+            "displayModeBar": True,
+            "modeBarButtonsToRemove": ["autoScale2d","lasso2d","select2d",
+                                        "toImage","sendDataToCloud"],
+            "displaylogo": False,
+            "doubleClick": "reset",
+            "showTips": False,
+            "plotGlPixelRatio": 2,
+        },
+    )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GUARD
 # ══════════════════════════════════════════════════════════════════════════════
-if not ALPACA_KEY or not ALPACA_SECRET:
-    st.error("🔑 Add **ALPACA_API_KEY** and **ALPACA_SECRET_KEY** to Streamlit secrets first.")
+if not TRADIER_TOKEN:
+    st.error("🔑 Add **TRADIER_TOKEN** to Streamlit secrets. Optionally add **TRADIER_ACCOUNT_ID** for trading.")
+    st.markdown("""
+**How to get your Tradier token:**
+1. Sign up at [tradier.com](https://tradier.com) — $10/month Pro plan for real-time data
+2. Go to **Account → API Access** and copy your **Bearer Token**
+3. In Streamlit Cloud: **App settings → Secrets** and add:
+```toml
+TRADIER_TOKEN = "your_bearer_token_here"
+TRADIER_ACCOUNT_ID = "VA000001"  # your account number
+```
+""")
     st.stop()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1202,7 +1331,7 @@ if not ALPACA_KEY or not ALPACA_SECRET:
 session_name,session_dot=market_session()
 st.markdown(
     f'<h1 style="color:#e6edf3;margin-bottom:2px">🧠 SPY Buddy — Quant Edition</h1>'
-    f'<p style="color:#8b949e;margin:0">Position-aware options manager · '
+    f'<p style="color:#8b949e;margin:0">Position-aware options manager · Powered by Tradier · '
     f'{session_dot} <span style="color:#e6edf3">{session_name}</span></p>',
     unsafe_allow_html=True)
 
@@ -1259,33 +1388,39 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════════════════
 # DATA FETCH
 # ══════════════════════════════════════════════════════════════════════════════
-pre_snapshot=get_stock_snapshot(symbol)
-pre_underlying_price=safe_get(pre_snapshot,"latestTrade","p")
+# ── Real-time quote ───────────────────────────────────────────────────────────
+quote = get_stock_quote(symbol)
+last_trade   = quote.get("last")
+daily_close  = quote.get("close")
+prev_close   = quote.get("prevclose")
 
-contracts_raw=get_option_contracts(symbol,None,option_side)
-expirations=sorted({c.get("expiration_date") for c in contracts_raw if c.get("expiration_date")})
+# ── Option expirations ────────────────────────────────────────────────────────
+expirations = get_option_expirations(symbol)
 
 colA,colB,colC=st.columns(3)
 with colA:
     expiration=st.selectbox("Expiration",expirations,index=0 if expirations else None)
 with colB:
-    contracts_for_exp=[c for c in contracts_raw if c.get("expiration_date")==expiration] if expiration else []
-    strikes=sorted({float(c.get("strike_price")) for c in contracts_for_exp if c.get("strike_price") is not None})
+    # Fetch chain for selected expiration to get strikes
+    chain_for_exp = get_option_chain(symbol, expiration, option_side) if expiration else []
+    strikes = sorted({float(c.get("strike",0)) for c in chain_for_exp if c.get("strike") is not None})
     default_strike_index=0
-    if strikes and pre_underlying_price is not None:
-        default_strike_index=min(range(len(strikes)),key=lambda i:abs(strikes[i]-float(pre_underlying_price)))
+    if strikes and last_trade is not None:
+        default_strike_index=min(range(len(strikes)),key=lambda i:abs(strikes[i]-float(last_trade)))
     strike=st.selectbox("Strike",strikes,index=default_strike_index if strikes else None)
 with colC:
     if st.button("🔄 Refresh",use_container_width=True,key="top_refresh_btn"):
         st.cache_data.clear(); st.rerun()
 
+# ── Find selected contract in chain ───────────────────────────────────────────
 selected_contract=None
+contract_symbol=None
 if expiration and strike is not None:
-    for c in contracts_for_exp:
-        if float(c.get("strike_price"))==float(strike):
+    for c in chain_for_exp:
+        if float(c.get("strike",0))==float(strike):
             selected_contract=c; break
-
-contract_symbol=selected_contract.get("symbol") if selected_contract else None
+    if selected_contract:
+        contract_symbol = selected_contract.get("symbol")
 
 # ── Bars + indicators ─────────────────────────────────────────────────────────
 bars=add_indicators(get_stock_bars(symbol,tf,200))
@@ -1297,33 +1432,36 @@ else:
     stock_bias,stock_score,stock_reasons,certainty_pct=stock_signal(bars)
     tf_biases={}
 
-# ── Snapshot data ─────────────────────────────────────────────────────────────
-underlying_snapshot=get_stock_snapshot(symbol)
-last_trade =safe_get(underlying_snapshot,"latestTrade","p")
-daily_close=safe_get(underlying_snapshot,"dailyBar","c")
-prev_close =safe_get(underlying_snapshot,"prevDailyBar","c")
+# ── Current RSI ───────────────────────────────────────────────────────────────
 current_rsi=None
 if not bars.empty and "RSI" in bars.columns and pd.notna(bars.iloc[-1].get("RSI")):
     current_rsi=float(bars.iloc[-1]["RSI"])
 vix_spot=get_vix_spot()
 
-snapshot        =get_option_snapshot(contract_symbol) if contract_symbol else {}
-quote_bid       =safe_get(snapshot,"latestQuote","bp")
-quote_ask       =safe_get(snapshot,"latestQuote","ap")
-quote_mid       =None
-if quote_bid is not None and quote_ask is not None:
-    quote_mid=(float(quote_bid)+float(quote_ask))/2.0
-last_option_trade=safe_get(snapshot,"latestTrade","p")
-current_premium  =quote_mid if quote_mid is not None else last_option_trade
+# ── Option data from chain (Tradier returns greeks + bid/ask in one call) ─────
+snapshot = {}
+quote_bid = quote_ask = quote_mid = last_option_trade = None
+delta = gamma = theta = vega = iv = None
+option_volume = open_interest = None
 
-delta=safe_get(snapshot,"greeks","delta")
-gamma=safe_get(snapshot,"greeks","gamma")
-theta=safe_get(snapshot,"greeks","theta")
-vega =safe_get(snapshot,"greeks","vega")
-iv   =safe_get(snapshot,"implied_volatility")
-day_bar=safe_get(snapshot,"dailyBar",default={}) or {}
-option_volume=day_bar.get("v")
-open_interest=selected_contract.get("open_interest") if selected_contract else None
+if selected_contract:
+    # All data is already in the chain response — no separate snapshot call needed
+    quote_bid  = selected_contract.get("bid")
+    quote_ask  = selected_contract.get("ask")
+    last_option_trade = selected_contract.get("last")
+    if quote_bid is not None and quote_ask is not None:
+        quote_mid = (float(quote_bid)+float(quote_ask))/2.0
+    option_volume  = selected_contract.get("volume")
+    open_interest  = selected_contract.get("open_interest")
+    greeks_data    = selected_contract.get("greeks") or {}
+    delta = greeks_data.get("delta")
+    gamma = greeks_data.get("gamma")
+    theta = greeks_data.get("theta")
+    vega  = greeks_data.get("vega")
+    iv    = greeks_data.get("mid_iv") or greeks_data.get("smv_vol")
+    snapshot = selected_contract  # for the "More details" expander
+
+current_premium = quote_mid if quote_mid is not None else last_option_trade
 
 quality=contract_quality(last_trade,strike,quote_bid,quote_ask,option_volume,open_interest,iv,delta)
 
@@ -1336,7 +1474,10 @@ managed   =manage_active_trade(
     current_premium,stock_bias)
 state=managed["state"] or base_state
 
-pcr_val,pcr_sentiment=compute_put_call_ratio(contracts_raw)
+# All contracts for PCR (fetch both calls and puts)
+all_contracts = get_option_chain(symbol, expiration) if expiration else []
+pcr_val,pcr_sentiment=compute_put_call_ratio(all_contracts)
+
 breakeven_price=None
 exp_move_low=exp_move_high=None
 if last_trade and iv and expiration:
@@ -1444,12 +1585,11 @@ st.divider()
 if show_auto_pick:
     section("🤖 Smart Contract Picker")
     with st.spinner("Scanning chain for best contract…"):
-        best=auto_pick_contract(contracts_raw,option_side,last_trade,min_dte,max_dte)
+        best=auto_pick_contract(all_contracts,option_side,last_trade,min_dte,max_dte)
     if best:
-        snap=best.get("_snap",{})
         ap1,ap2,ap3,ap4,ap5,ap6=st.columns(6)
         ap1.metric("Best Contract",best.get("symbol","N/A"))
-        ap2.metric("Strike",       fmt_money(best.get("strike_price")))
+        ap2.metric("Strike",       fmt_money(best.get("strike")))
         ap3.metric("Expiry",       best.get("expiration_date","N/A"))
         ap4.metric("DTE",          best.get("_dte","N/A"))
         ap5.metric("Delta",        fmt_num(best.get("_delta"),3))
@@ -1457,15 +1597,16 @@ if show_auto_pick:
         ap_b1,ap_b2,ap_b3,ap_b4=st.columns(4)
         ap_b1.metric("Bid",  fmt_money(best.get("_bid")))
         ap_b2.metric("Ask",  fmt_money(best.get("_ask")))
-        ap_b3.metric("IV",   fmt_num(safe_get(snap,"implied_volatility"),3))
+        ap_b3.metric("IV",   fmt_num(safe_get(best.get("greeks",{}),"mid_iv"),3))
         ap_b4.metric("OI",   fmt_num(best.get("open_interest"),0))
-        if last_trade and safe_get(snap,"implied_volatility") and best.get("expiration_date"):
+        if last_trade and best.get("greeks") and best.get("expiration_date"):
             try:
                 dte_ap=(dt.date.fromisoformat(best["expiration_date"])-dt.date.today()).days
-                if dte_ap>0:
-                    be_ap=(float(best["strike_price"])+float(best["_ask"])) if option_side=="Call" \
-                          else (float(best["strike_price"])-float(best["_ask"]))
-                    em_lo,em_hi=expected_move(float(last_trade),float(safe_get(snap,"implied_volatility")),dte_ap)
+                iv_ap = safe_get(best.get("greeks",{}),"mid_iv") or safe_get(best.get("greeks",{}),"smv_vol")
+                if dte_ap>0 and iv_ap:
+                    be_ap=(float(best["strike"])+float(best["_ask"])) if option_side=="Call" \
+                          else (float(best["strike"])-float(best["_ask"]))
+                    em_lo,em_hi=expected_move(float(last_trade),float(iv_ap),dte_ap)
                     ap_c1,ap_c2,ap_c3=st.columns(3)
                     ap_c1.metric("Breakeven",fmt_money(be_ap))
                     ap_c2.metric("Expected Move Low", fmt_money(em_lo))
@@ -1574,8 +1715,8 @@ else:
 
 l1,l2,l3,l4,l5,l6=st.columns(6)
 l1.metric("Position?",      "Yes" if has_position else "No")
-l2.metric("Qty",            str(st.session_state.active_trade["qty"]) if is_same_locked_trade else (pos.get("qty") if pos else "0"))
-l3.metric("Locked Entry",   fmt_money(st.session_state.active_trade["entry_premium"]) if is_same_locked_trade else fmt_money(pos.get("avg_entry_price") if pos else None))
+l2.metric("Qty",            str(st.session_state.active_trade["qty"]) if is_same_locked_trade else (pos.get("quantity") if pos else "0"))
+l3.metric("Locked Entry",   fmt_money(st.session_state.active_trade["entry_premium"]) if is_same_locked_trade else fmt_money(pos.get("cost_basis") if pos else None))
 l4.metric("Current Premium",fmt_money(current_premium))
 l5.metric("Custom P/L",     fmt_money(custom_pl),delta=f"{custom_pl_pct:.2f}%" if custom_pl_pct is not None else None)
 l6.metric("Custom P/L %",   fmt_num(custom_pl_pct,2))
@@ -1597,15 +1738,17 @@ if a1.button("🔒 Start / Lock Trade",use_container_width=True,disabled=not can
                        "premium_stop":float(premium_stop),"tp1":float(tp1),"tp2":float(tp2)})
     st.success("Trade locked. Entry, stop, and targets will now stay fixed.")
 
-if a2.button("📈 Paper Buy to Open",use_container_width=True,disabled=contract_symbol is None,key="buy_open_btn"):
+if a2.button("📈 Buy to Open",use_container_width=True,disabled=contract_symbol is None,key="buy_open_btn"):
     try:
-        order=place_option_order(contract_symbol,int(qty),"buy",order_style,limit_price if order_style=="limit" else None)
+        order=place_option_order(contract_symbol,int(qty),"buy_to_open",order_style,
+                                 limit_price if order_style=="limit" else None)
         st.success(f"Submitted buy order: {order.get('id','ok')}")
     except Exception as e: st.error(f"Buy order failed: {e}")
 
-if a3.button("📉 Paper Sell to Close",use_container_width=True,disabled=contract_symbol is None,key="sell_close_btn"):
+if a3.button("📉 Sell to Close",use_container_width=True,disabled=contract_symbol is None,key="sell_close_btn"):
     try:
-        order=place_option_order(contract_symbol,int(qty),"sell",order_style,limit_price if order_style=="limit" else None)
+        order=place_option_order(contract_symbol,int(qty),"sell_to_close",order_style,
+                                 limit_price if order_style=="limit" else None)
         st.success(f"Submitted sell order: {order.get('id','ok')}")
         if active_trade_matches(contract_symbol): clear_active_trade()
     except Exception as e: st.error(f"Sell order failed: {e}")
@@ -1618,11 +1761,11 @@ if c2.button("🔄 Refresh data",use_container_width=True,key="bottom_refresh_bt
 
 st.divider()
 
-# ── Chart ──────────────────────────────────────────────────────────────────────────────
+# ── Chart ──────────────────────────────────────────────────────────────────────
 section("Underlying Chart")
 if not bars.empty:
     make_chart(bars, symbol, breakeven_price)
-    st.caption("▲ BUY (green)  ▼ SELL (red)  ▲/▼ EXIT (orange) · Scroll = zoom · Drag = pan · Box-select = zoom area")
+    st.caption("▲ BUY (green)  ▼ SELL (red)  ▲/▼ EXIT (orange) · Scroll = zoom · Drag = pan · Double-click = reset")
 else:
     st.info("No underlying chart data returned.")
 
@@ -1633,8 +1776,14 @@ if not news:
     st.write("No recent news returned.")
 else:
     for item in news[:6]:
-        headline=item.get("headline","No headline"); source=item.get("source","")
-        ts=item.get("updated_at",item.get("created_at","")); summary=item.get("summary","")
+        headline=item.get("title","No headline")
+        source  =item.get("publisher","")
+        ts      =item.get("providerPublishTime","")
+        if ts:
+            try: ts=dt.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
+            except: pass
+        summary =item.get("summary","")
+        link    =item.get("link","")
         st.markdown(
             f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;'
             f'padding:14px 18px;margin-bottom:10px">'
@@ -1650,6 +1799,6 @@ if st.session_state.trade_history:
         st.dataframe(hist_df,use_container_width=True)
 
 with st.expander("More contract details"):
-    st.json({"contract":selected_contract or {},"snapshot":snapshot or {}})
+    st.json({"contract":selected_contract or {}})
 
-st.caption("SPY Buddy Quant Edition · TradingView Charts · Top-Down Analysis · Research / education only · Not financial advice.")
+st.caption("SPY Buddy Quant Edition · Tradier Real-Time Data · Top-Down Analysis · Research / education only · Not financial advice.")
