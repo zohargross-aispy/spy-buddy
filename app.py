@@ -1,15 +1,14 @@
 """
 SPY Buddy Options — Quant Edition  (TradingView Chart + Top-Down Analysis)
 ==========================================================================
-Changes vs app(1).py:
-  • Replaced Plotly chart with TradingView Lightweight Charts
-    – Native candlestick rendering, smooth zoom/pan, real crosshair
-    – Sub-panels: Volume, RSI/StochRSI, MACD, TTM Squeeze
-    – Markers rendered as native TV chart markers (▲ BUY / ▼ SELL / ✕ EXIT)
-  • Fixed signal detection: prev_state tracked inside the loop (not via .shift)
-  • Added Top-Down Analysis panel: W / D / 4H / 1H / 15min / 5min
-    – Each timeframe shows bias, score, key reasons, and colour-coded badge
-    – Cascade alignment indicator (all agree = high confidence)
+Fixes in this version:
+  • TradingView chart: use plain string time 'YYYY-MM-DD HH:MM:SS' (not unix int)
+    which is what streamlit-lightweight-charts 0.7.20 JS renderer expects.
+    Series type passed as plain string ('Candlestick', 'Line', 'Histogram')
+    instead of Chart enum to avoid serialisation issues.
+  • Signals: prev_state tracked inside loop (not via .shift) — no duplicates.
+  • Top-Down Analysis: 1H/4H/Daily use EMA 21/50/200 for better HTF analysis.
+  • Sidebar: Account Size + Risk % calculator showing max $ risk per trade.
 """
 
 import math
@@ -21,7 +20,7 @@ import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
-from streamlit_lightweight_charts import renderLightweightCharts, Chart
+from streamlit_lightweight_charts import renderLightweightCharts
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE CONFIG
@@ -65,7 +64,13 @@ input, select, textarea,
 [data-testid="stDataFrame"] { border:1px solid #30363d!important; border-radius:8px!important; }
 hr { border-color:#30363d!important; }
 small, .stCaption, [data-testid="stCaptionContainer"] { color:#8b949e!important; }
-/* Top-Down Analysis cards */
+.risk-box {
+    background:#0d2137; border:1px solid #1d4ed8; border-radius:10px;
+    padding:14px 16px; margin:8px 0 4px;
+}
+.risk-label { color:#93c5fd; font-size:.75rem; font-weight:700; text-transform:uppercase; letter-spacing:.06em; }
+.risk-value { color:#e6edf3; font-size:1.45rem; font-weight:900; margin-top:2px; }
+.risk-sub   { color:#8b949e; font-size:.75rem; margin-top:2px; }
 .tda-card {
     background:#161b22; border:1px solid #30363d; border-radius:10px;
     padding:12px 14px; margin-bottom:4px;
@@ -213,11 +218,9 @@ def get_stock_bars(symbol:str,timeframe:str="5Min",limit:int=200)->pd.DataFrame:
 def get_vix_spot()->Optional[float]:
     try:
         vix = yf.Ticker("^VIX").history(period="5d", interval="1d", auto_adjust=False)
-        if vix is None or vix.empty:
-            return None
+        if vix is None or vix.empty: return None
         return float(vix["Close"].dropna().iloc[-1])
-    except Exception:
-        return None
+    except: return None
 
 @st.cache_data(ttl=60)
 def get_option_contracts(symbol:str,expiration_date:Optional[str],option_type:Optional[str])->list:
@@ -254,7 +257,11 @@ def place_option_order(symbol:str,qty:int,side:str,order_type:str="market",limit
 # ══════════════════════════════════════════════════════════════════════════════
 # INDICATOR ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
-def add_indicators(df:pd.DataFrame)->pd.DataFrame:
+def add_indicators(df:pd.DataFrame, htf:bool=False)->pd.DataFrame:
+    """
+    htf=True  → add EMA 21/50/200 (for 1H, 4H, Daily TDA analysis)
+    htf=False → add EMA 8/21/50  (for primary chart and lower TFs)
+    """
     out=df.copy()
     if out.empty or len(out)<10: return out
     for col in ["Open","High","Low","Close","Volume"]:
@@ -263,9 +270,17 @@ def add_indicators(df:pd.DataFrame)->pd.DataFrame:
     out=out.dropna(subset=["Close"])
     if out.empty or len(out)<10: return out
 
-    out["EMA_8"] =out["Close"].ewm(span=8, adjust=False).mean()
-    out["EMA_21"]=out["Close"].ewm(span=21,adjust=False).mean()
-    out["EMA_50"]=out["Close"].ewm(span=50,adjust=False).mean()
+    if htf:
+        # Higher timeframe: 21 / 50 / 200 EMA
+        out["EMA_21"] =out["Close"].ewm(span=21, adjust=False).mean()
+        out["EMA_50"] =out["Close"].ewm(span=50, adjust=False).mean()
+        out["EMA_200"]=out["Close"].ewm(span=200,adjust=False).mean()
+        # Alias so stock_signal can still reference EMA_8 → use EMA_21 as proxy
+        out["EMA_8"]=out["EMA_21"]
+    else:
+        out["EMA_8"] =out["Close"].ewm(span=8, adjust=False).mean()
+        out["EMA_21"]=out["Close"].ewm(span=21,adjust=False).mean()
+        out["EMA_50"]=out["Close"].ewm(span=50,adjust=False).mean()
 
     delta=out["Close"].diff()
     gain=delta.clip(lower=0); loss=-delta.clip(upper=0)
@@ -434,6 +449,96 @@ def stock_signal(df:pd.DataFrame)->Tuple[str,int,List[str],int]:
     certainty_pct=int(certainty_points/max(certainty_max,1)*100) if bias!="NEUTRAL" else max(0,int((certainty_points/max(certainty_max,1)*100)-20))
     return bias,score,reasons,certainty_pct
 
+def stock_signal_htf(df:pd.DataFrame)->Tuple[str,int,List[str],int]:
+    """
+    Higher-timeframe signal using EMA 21/50/200.
+    Used for 1H, 4H, Daily TDA cards.
+    """
+    if df.empty or len(df)<30:
+        return "NEUTRAL",0,["Not enough bar data."],0
+
+    row=df.iloc[-1]
+    score=0; reasons=[]; certainty_points=0; certainty_max=0
+
+    # EMA 21 / 50 / 200 structure
+    certainty_max+=3
+    if pd.notna(row.get("EMA_21")) and row["Close"]>row["EMA_21"]:
+        score+=1; certainty_points+=1; reasons.append("✅ Price above EMA 21.")
+    else:
+        score-=1; reasons.append("❌ Price below EMA 21.")
+    if pd.notna(row.get("EMA_21")) and pd.notna(row.get("EMA_50")) and row["EMA_21"]>row["EMA_50"]:
+        score+=1; certainty_points+=1; reasons.append("✅ EMA 21 above EMA 50.")
+    else:
+        score-=1; reasons.append("❌ EMA 21 below EMA 50.")
+    if pd.notna(row.get("EMA_50")) and pd.notna(row.get("EMA_200")) and row["EMA_50"]>row["EMA_200"]:
+        score+=1; certainty_points+=1; reasons.append("✅ EMA 50 above EMA 200 — long-term bull.")
+    else:
+        score-=1; reasons.append("❌ EMA 50 below EMA 200 — long-term bear.")
+
+    # Price vs EMA 200
+    certainty_max+=1
+    if pd.notna(row.get("EMA_200")):
+        if row["Close"]>row["EMA_200"]:
+            score+=1; certainty_points+=1; reasons.append(f"✅ Price above EMA 200 (${row['EMA_200']:.2f}).")
+        else:
+            score-=1; reasons.append(f"❌ Price below EMA 200 (${row['EMA_200']:.2f}) — bearish structure.")
+
+    certainty_max+=1
+    if pd.notna(row.get("RSI")):
+        if row["RSI"]>55:
+            score+=1; certainty_points+=1; reasons.append(f"✅ RSI {row['RSI']:.1f} — bullish momentum.")
+        elif row["RSI"]<45:
+            score-=1; reasons.append(f"❌ RSI {row['RSI']:.1f} — bearish momentum.")
+        else:
+            reasons.append(f"⚪ RSI {row['RSI']:.1f} — neutral zone.")
+
+    certainty_max+=2
+    if pd.notna(row.get("MACD")) and pd.notna(row.get("MACD_signal")):
+        if row["MACD"]>row["MACD_signal"]:
+            score+=1; certainty_points+=1; reasons.append("✅ MACD above signal — bullish.")
+        else:
+            score-=1; reasons.append("❌ MACD below signal — bearish.")
+        if pd.notna(row.get("MACD_hist")):
+            if row["MACD_hist"]>0:
+                score+=1; certainty_points+=1; reasons.append("✅ MACD histogram positive.")
+            else:
+                score-=1; reasons.append("❌ MACD histogram negative.")
+
+    certainty_max+=2
+    if pd.notna(row.get("ADX")):
+        adx=row["ADX"]
+        if adx>25:
+            certainty_points+=1
+            if pd.notna(row.get("DI_plus")) and pd.notna(row.get("DI_minus")):
+                if row["DI_plus"]>row["DI_minus"]:
+                    score+=1; certainty_points+=1; reasons.append(f"✅ ADX {adx:.1f} — strong uptrend.")
+                else:
+                    score-=1; reasons.append(f"❌ ADX {adx:.1f} — strong downtrend.")
+        elif adx<18:
+            score-=1; reasons.append(f"⚠️ ADX {adx:.1f} — choppy, low conviction.")
+
+    if score>=3:   bias="BULLISH"
+    elif score<=-3: bias="BEARISH"
+    else:           bias="NEUTRAL"
+    certainty_pct=int(certainty_points/max(certainty_max,1)*100) if bias!="NEUTRAL" else max(0,int((certainty_points/max(certainty_max,1)*100)-20))
+    return bias,score,reasons,certainty_pct
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MARKET SESSION
+# ══════════════════════════════════════════════════════════════════════════════
+def market_session()->Tuple[str,str]:
+    now=dt.datetime.now(dt.timezone(dt.timedelta(hours=-4)))
+    t=now.time()
+    if t<dt.time(4,0):   return "Closed","🔴"
+    if t<dt.time(9,30):  return "Pre-Market","🟡"
+    if t<dt.time(16,0):  return "Market Open","🟢"
+    if t<dt.time(20,0):  return "After-Hours","🟡"
+    return "Closed","🔴"
+
+def expected_move(price:float,iv:float,dte:int)->Tuple[float,float]:
+    move=price*iv*math.sqrt(dte/365)
+    return round(price-move,2),round(price+move,2)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MULTI-TIMEFRAME SIGNAL
 # ══════════════════════════════════════════════════════════════════════════════
@@ -477,39 +582,41 @@ def multi_tf_signal(symbol:str,primary_tf:str)->Tuple[str,int,List[str],int,Dict
 # ══════════════════════════════════════════════════════════════════════════════
 # TOP-DOWN ANALYSIS  (W / D / 4H / 1H / 15min / 5min)
 # ══════════════════════════════════════════════════════════════════════════════
-# Alpaca timeframe strings for each TDA level
+# label, alpaca_tf, limit, use_htf_emas, purpose
 _TDA_TIMEFRAMES = [
-    ("Weekly",  "1Week",  80,  "Macro trend — is the big picture bullish or bearish?"),
-    ("Daily",   "1Day",   120, "Intermediate trend — swing direction."),
-    ("4-Hour",  "4Hour",  120, "Short-term trend — intraday swing bias."),
-    ("1-Hour",  "1Hour",  150, "Intraday momentum — entry zone confirmation."),
-    ("15-Min",  "15Min",  150, "Execution context — is momentum aligned?"),
-    ("5-Min",   "5Min",   200, "Entry trigger — fine-tune entry timing."),
+    ("Weekly",  "1Week",  80,  False, "Macro trend — big-picture direction."),
+    ("Daily",   "1Day",   120, True,  "Intermediate trend — swing direction. EMA 21/50/200."),
+    ("4-Hour",  "4Hour",  120, True,  "Short-term trend — intraday swing bias. EMA 21/50/200."),
+    ("1-Hour",  "1Hour",  150, True,  "Intraday momentum — entry zone. EMA 21/50/200."),
+    ("15-Min",  "15Min",  150, False, "Execution context — is momentum aligned?"),
+    ("5-Min",   "5Min",   200, False, "Entry trigger — fine-tune entry timing."),
 ]
 
 @st.cache_data(ttl=45)
 def get_tda_panel(symbol:str)->List[dict]:
     results=[]
-    for label,tf,limit,purpose in _TDA_TIMEFRAMES:
+    for label,tf,limit,use_htf,purpose in _TDA_TIMEFRAMES:
         try:
-            df=add_indicators(get_stock_bars(symbol,tf,limit))
+            df=add_indicators(get_stock_bars(symbol,tf,limit), htf=use_htf)
             if df.empty or len(df)<20:
                 results.append({"label":label,"tf":tf,"bias":"N/A","score":0,
-                                 "reasons":["Not enough data."],"cert":0,"purpose":purpose})
+                                 "reasons":["Not enough data."],"cert":0,"purpose":purpose,"htf":use_htf})
                 continue
-            bias,score,reasons,cert=stock_signal(df)
+            if use_htf:
+                bias,score,reasons,cert=stock_signal_htf(df)
+            else:
+                bias,score,reasons,cert=stock_signal(df)
             results.append({"label":label,"tf":tf,"bias":bias,"score":score,
-                             "reasons":reasons[:3],"cert":cert,"purpose":purpose})
+                             "reasons":reasons[:3],"cert":cert,"purpose":purpose,"htf":use_htf})
         except Exception as e:
             results.append({"label":label,"tf":tf,"bias":"ERROR","score":0,
-                             "reasons":[str(e)],"cert":0,"purpose":purpose})
+                             "reasons":[str(e)],"cert":0,"purpose":purpose,"htf":use_htf})
     return results
 
 def render_tda_panel(symbol:str):
     section("Top-Down Analysis — W / D / 4H / 1H / 15min / 5min")
     tda=get_tda_panel(symbol)
 
-    # Cascade alignment summary
     valid_biases=[r["bias"] for r in tda if r["bias"] not in ("N/A","ERROR","NEUTRAL")]
     bull_count=sum(1 for b in valid_biases if b=="BULLISH")
     bear_count=sum(1 for b in valid_biases if b=="BEARISH")
@@ -526,34 +633,30 @@ def render_tda_panel(symbol:str):
     elif bear_count>=4:
         cascade_html=f'<div class="cascade-ok" style="background:#450a0a;border-color:#f87171;color:#f87171">{bear_count}/{total} timeframes BEARISH — Strong bearish alignment. Good for PUTS.</div>'
     elif bull_count>bear_count:
-        cascade_html=f'<div class="cascade-warn">⚠️ {bull_count}/{total} BULLISH — Partial alignment. Reduce size or wait for confirmation.</div>'
+        cascade_html=f'<div class="cascade-warn">⚠️ {bull_count}/{total} BULLISH — Partial alignment. Reduce size or wait.</div>'
     elif bear_count>bull_count:
-        cascade_html=f'<div class="cascade-warn">⚠️ {bear_count}/{total} BEARISH — Partial alignment. Reduce size or wait for confirmation.</div>'
+        cascade_html=f'<div class="cascade-warn">⚠️ {bear_count}/{total} BEARISH — Partial alignment. Reduce size or wait.</div>'
     else:
-        cascade_html='<div class="cascade-neut">⚪ Mixed signals across timeframes — No clear directional edge. Stay flat.</div>'
+        cascade_html='<div class="cascade-neut">⚪ Mixed signals — No clear directional edge. Stay flat.</div>'
 
     st.markdown(cascade_html,unsafe_allow_html=True)
     st.markdown("<br>",unsafe_allow_html=True)
 
-    # 6-column grid
     cols=st.columns(6)
     for i,r in enumerate(tda):
         bias=r["bias"]
-        if bias=="BULLISH":
-            bias_cls="tda-bias-bull"; bias_icon="▲ BULLISH"
-        elif bias=="BEARISH":
-            bias_cls="tda-bias-bear"; bias_icon="▼ BEARISH"
-        elif bias=="NEUTRAL":
-            bias_cls="tda-bias-neut"; bias_icon="◆ NEUTRAL"
-        else:
-            bias_cls="tda-bias-neut"; bias_icon=f"— {bias}"
+        if bias=="BULLISH":   bias_cls="tda-bias-bull"; bias_icon="▲ BULLISH"
+        elif bias=="BEARISH": bias_cls="tda-bias-bear"; bias_icon="▼ BEARISH"
+        elif bias=="NEUTRAL": bias_cls="tda-bias-neut"; bias_icon="◆ NEUTRAL"
+        else:                 bias_cls="tda-bias-neut"; bias_icon=f"— {bias}"
 
+        ema_note=" <small style='color:#4b5563'>(21/50/200)</small>" if r.get("htf") else ""
         cert_color="#4ade80" if r["cert"]>=65 else ("#f59e0b" if r["cert"]>=45 else "#ef4444")
         reasons_html="<br>".join(r["reasons"][:3])
 
         card=f"""
 <div class="tda-card">
-  <div class="tda-tf">{r['label']}</div>
+  <div class="tda-tf">{r['label']}{ema_note}</div>
   <div class="{bias_cls}">{bias_icon}</div>
   <div class="tda-score" style="color:{cert_color}">Score: {r['score']:+d} &nbsp;|&nbsp; {r['cert']}%</div>
   <div class="tda-reason">{reasons_html}</div>
@@ -563,18 +666,19 @@ def render_tda_panel(symbol:str):
     with st.expander("What is Top-Down Analysis?"):
         st.markdown("""
 **Top-Down Analysis** starts from the highest timeframe and works down to the execution timeframe.
-The idea is simple: **trade in the direction of the dominant trend**.
+Trade in the direction of the dominant trend.
 
-| Timeframe | Role |
-|-----------|------|
-| **Weekly** | Macro trend — defines the big-picture direction |
-| **Daily** | Intermediate trend — swing bias |
-| **4-Hour** | Short-term trend — intraday swing direction |
-| **1-Hour** | Intraday momentum — confirms entry zone |
-| **15-Min** | Execution context — is momentum aligned? |
-| **5-Min** | Entry trigger — fine-tune entry timing |
+| Timeframe | EMAs Used | Role |
+|-----------|-----------|------|
+| **Weekly** | 8/21/50 | Macro trend — big-picture direction |
+| **Daily** | **21/50/200** | Intermediate trend — swing bias |
+| **4-Hour** | **21/50/200** | Short-term trend — intraday swing |
+| **1-Hour** | **21/50/200** | Intraday momentum — entry zone |
+| **15-Min** | 8/21/50 | Execution context |
+| **5-Min** | 8/21/50 | Entry trigger |
 
-**Cascade rule:** The more timeframes that agree, the higher the conviction. A full 6/6 alignment is the highest-probability setup. Mixed signals = stay flat or reduce size.
+**Cascade rule:** The more timeframes that agree, the higher the conviction.
+Full 6/6 alignment = highest-probability setup. Mixed = stay flat or reduce size.
 """)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -607,13 +711,12 @@ def state_series(df:pd.DataFrame)->pd.DataFrame:
             else:                            state="HOLD SELL"
         prev_states.append(prev_state)
         states.append(state)
-        prev_state=state   # ← FIXED: track inside loop, not via .shift()
+        prev_state=state   # ← FIXED: track inside loop
     out["state"]=states
     out["prev_state"]=prev_states
     return out
 
 def find_chart_signals(df:pd.DataFrame):
-    """Return DataFrames of BUY / SELL / EXIT BUY / EXIT SELL signal rows."""
     marked=state_series(df)
     buy_rows,sell_rows,exit_buy_rows,exit_sell_rows=[],[],[],[]
     for _,row in marked.iterrows():
@@ -703,102 +806,49 @@ def auto_pick_contract(contracts_raw:list,option_type:str,underlying_price:Optio
     today=dt.date.today()
     candidates=[]
     for c in contracts_raw:
-        if c.get("type","").lower()!=option_type.lower(): continue
-        exp_str=c.get("expiration_date")
-        if not exp_str: continue
-        try:
-            exp=dt.date.fromisoformat(exp_str)
-            dte=(exp-today).days
+        exp=c.get("expiration_date")
+        if not exp: continue
+        try: dte=(dt.date.fromisoformat(exp)-today).days
         except: continue
         if not (min_dte<=dte<=max_dte): continue
-        oi=float(c.get("open_interest") or 0)
-        if oi<100: continue
-        candidates.append((c,dte))
-
-    best=None; best_score=float("inf")
-    for c,dte in candidates:
         sym=c.get("symbol")
         if not sym: continue
         try:
             snap=get_option_snapshot(sym)
+            delta=safe_get(snap,"greeks","delta")
             bid=safe_get(snap,"latestQuote","bp")
             ask=safe_get(snap,"latestQuote","ap")
-            delta_val=safe_get(snap,"greeks","delta")
-            if bid is None or ask is None or delta_val is None: continue
-            delta_abs=abs(float(delta_val))
+            oi=c.get("open_interest") or 0
+            if delta is None or bid is None or ask is None: continue
+            delta_abs=abs(float(delta))
             if not (0.35<=delta_abs<=0.60): continue
-            spread=float(ask)-float(bid)
-            spread_pct=spread/float(ask) if ask>0 else 999
-            score=spread_pct+abs(delta_abs-0.50)*2
-            if score<best_score:
-                best_score=score
-                best={**c,"_snap":snap,"_dte":dte,"_delta":float(delta_val),
-                      "_bid":float(bid),"_ask":float(ask),"_spread_pct":spread_pct}
+            if float(oi)<100: continue
+            spread_pct=(float(ask)-float(bid))/float(ask) if float(ask)>0 else 1
+            if spread_pct>0.20: continue
+            candidates.append({**c,"_delta":float(delta),"_bid":float(bid),"_ask":float(ask),
+                                "_dte":dte,"_spread_pct":spread_pct,"_snap":snap})
         except: continue
-    return best
+    if not candidates: return None
+    candidates.sort(key=lambda x:(abs(abs(x["_delta"])-0.50),x["_spread_pct"]))
+    return candidates[0]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KELLY CRITERION SIZING
-# ══════════════════════════════════════════════════════════════════════════════
-def kelly_contracts(win_rate:float,avg_win_pct:float,avg_loss_pct:float,
-                    account_size:float,premium:float,max_risk_pct:float=2.0)->dict:
-    if avg_loss_pct<=0 or premium<=0:
-        return {"kelly_pct":0,"contracts":0,"max_loss":0,"max_gain":0,"notes":"Invalid inputs"}
-    b=avg_win_pct/avg_loss_pct
-    p=win_rate; q=1-p
-    full_kelly=(p*b-q)/b if b>0 else 0
-    quarter_kelly=max(0,full_kelly/4)
-    max_risk_dollar=account_size*(max_risk_pct/100)
-    cost_per_contract=premium*100
-    kelly_contracts_count=int(account_size*quarter_kelly/max(cost_per_contract,0.01))
-    risk_contracts_count=int(max_risk_dollar/max(cost_per_contract,0.01))
-    contracts=max(1,min(kelly_contracts_count,risk_contracts_count))
-    return {
-        "full_kelly_pct":round(full_kelly*100,1),
-        "quarter_kelly_pct":round(quarter_kelly*100,1),
-        "contracts":contracts,
-        "total_cost":round(contracts*cost_per_contract,2),
-        "max_loss":round(contracts*cost_per_contract,2),
-        "max_gain":round(contracts*cost_per_contract*avg_win_pct,2),
-        "notes":f"¼ Kelly={quarter_kelly*100:.1f}%, capped by {max_risk_pct}% risk rule"
-    }
-
-# ══════════════════════════════════════════════════════════════════════════════
-# EXPECTED MOVE
-# ══════════════════════════════════════════════════════════════════════════════
-def expected_move(underlying_price:float,iv:float,dte:int)->Tuple[float,float]:
-    daily_move=underlying_price*iv*math.sqrt(dte/365)
-    return round(underlying_price-daily_move,2),round(underlying_price+daily_move,2)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MARKET SESSION
-# ══════════════════════════════════════════════════════════════════════════════
-def market_session()->Tuple[str,str]:
-    now=dt.datetime.now(dt.timezone(dt.timedelta(hours=-5)))
-    t=now.time()
-    pre=dt.time(4,0); open_=dt.time(9,30); close=dt.time(16,0); post=dt.time(20,0)
-    if t<pre:    return "CLOSED","⚫"
-    if t<open_:  return "PRE-MARKET","🟡"
-    if t<close:  return "REGULAR","🟢"
-    if t<post:   return "AFTER-HOURS","🟠"
-    return "CLOSED","⚫"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STATE LOGIC
+# OPTIONS STATE MACHINE
 # ══════════════════════════════════════════════════════════════════════════════
 def derive_options_state(stock_bias:str,option_side:str,has_position:bool,quality_ok:bool)->str:
     side=option_side.upper()
     if not quality_ok: return "NO TRADE"
-    if side=="CALL":
-        if stock_bias=="BULLISH" and not has_position: return "ENTER CALL"
-        if stock_bias=="BULLISH" and has_position:     return "HOLD CALL"
-        if stock_bias!="BULLISH" and has_position:     return "WEAKENING"
+    if not has_position:
+        if stock_bias=="BULLISH" and side=="CALL": return "ENTER CALL"
+        if stock_bias=="BEARISH" and side=="PUT":  return "ENTER PUT"
         return "NO TRADE"
-    if side=="PUT":
-        if stock_bias=="BEARISH" and not has_position: return "ENTER PUT"
-        if stock_bias=="BEARISH" and has_position:     return "HOLD PUT"
-        if stock_bias!="BEARISH" and has_position:     return "WEAKENING"
-        return "NO TRADE"
+    else:
+        if side=="CALL":
+            if stock_bias=="BULLISH": return "HOLD CALL"
+            return "EXIT CALL"
+        if side=="PUT":
+            if stock_bias=="BEARISH": return "HOLD PUT"
+            return "EXIT PUT"
     return "NO TRADE"
 
 def manage_active_trade(active_trade:Optional[dict],current_premium:Optional[float],stock_bias:str)->dict:
@@ -817,16 +867,24 @@ def manage_active_trade(active_trade:Optional[dict],current_premium:Optional[flo
     return {"state":state,"notes":notes}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TRADINGVIEW LIGHTWEIGHT CHART
+# TRADINGVIEW LIGHTWEIGHT CHART  (FIXED)
 # ══════════════════════════════════════════════════════════════════════════════
-def _ts(t)->int:
-    """Convert pandas Timestamp to Unix epoch integer (seconds)."""
-    if hasattr(t,"timestamp"):
-        return int(t.timestamp())
-    return int(pd.Timestamp(t).timestamp())
+def _tv_time(t)->str:
+    """
+    Convert pandas Timestamp to the string format that streamlit-lightweight-charts
+    0.7.x passes to the TradingView JS renderer.
+    TV Lightweight Charts accepts:
+      - 'YYYY-MM-DD'           for daily/weekly data
+      - 'YYYY-MM-DD HH:MM:SS'  for intraday data
+    We always use the full datetime string so intraday bars render correctly.
+    """
+    ts=pd.Timestamp(t)
+    if ts.tzinfo is not None:
+        ts=ts.tz_convert("UTC").tz_localize(None)
+    return ts.strftime("%Y-%m-%d %H:%M:%S")
 
 def make_tv_chart(df:pd.DataFrame, symbol:str, breakeven:Optional[float]=None):
-    """Render a TradingView Lightweight Chart with sub-panels via renderLightweightCharts."""
+    """Render a TradingView Lightweight Chart with sub-panels."""
     if df.empty:
         st.info("No chart data available.")
         return
@@ -835,6 +893,10 @@ def make_tv_chart(df:pd.DataFrame, symbol:str, breakeven:Optional[float]=None):
     cdf["Time"]=pd.to_datetime(cdf["Time"],errors="coerce")
     cdf=cdf.dropna(subset=["Time"]).sort_values("Time").tail(150).reset_index(drop=True)
 
+    if cdf.empty:
+        st.info("No chart data after cleaning.")
+        return
+
     has_rsi    ="RSI"          in cdf.columns and cdf["RSI"].notna().sum()>5
     has_macd   ="MACD"         in cdf.columns and cdf["MACD"].notna().sum()>5
     has_squeeze="Squeeze_hist" in cdf.columns and cdf["Squeeze_hist"].notna().sum()>5
@@ -842,10 +904,10 @@ def make_tv_chart(df:pd.DataFrame, symbol:str, breakeven:Optional[float]=None):
     has_bb     ="BB_upper"     in cdf.columns and cdf["BB_upper"].notna().sum()>5
 
     # ── Shared chart options ────────────────────────────────────────────────
-    _chart_opts = {
+    _base = {
         "layout": {
             "background": {"type":"solid","color":"#0d1117"},
-            "textColor": "#c9d1d9",
+            "textColor":  "#c9d1d9",
             "fontFamily": "monospace",
         },
         "grid": {
@@ -854,61 +916,80 @@ def make_tv_chart(df:pd.DataFrame, symbol:str, breakeven:Optional[float]=None):
         },
         "crosshair": {"mode": 1},
         "timeScale": {
-            "borderColor": "#30363d",
-            "timeVisible": True,
+            "borderColor":    "#30363d",
+            "timeVisible":    True,
             "secondsVisible": False,
         },
         "rightPriceScale": {"borderColor":"#30363d"},
     }
+    # Sub-panels hide the time axis to save space
+    _sub = {**_base, "timeScale": {**_base["timeScale"], "visible": False}}
 
-    # ── 1. CANDLESTICK data ─────────────────────────────────────────────────
+    # ── 1. Candlestick data ─────────────────────────────────────────────────
     candle_data=[
-        {"time":_ts(r["Time"]),"open":round(r["Open"],4),"high":round(r["High"],4),
-         "low":round(r["Low"],4),"close":round(r["Close"],4)}
+        {
+            "time":  _tv_time(r["Time"]),
+            "open":  round(float(r["Open"]),  4),
+            "high":  round(float(r["High"]),  4),
+            "low":   round(float(r["Low"]),   4),
+            "close": round(float(r["Close"]), 4),
+        }
         for _,r in cdf.iterrows()
         if pd.notna(r["Open"]) and pd.notna(r["Close"])
     ]
 
-    # ── 2. Signal markers (FIXED logic) ────────────────────────────────────
+    # ── 2. Signal markers ───────────────────────────────────────────────────
     buy_df,sell_df,exit_buy_df,exit_sell_df=find_chart_signals(cdf)
     markers=[]
     for _,r in buy_df.iterrows():
-        markers.append({"time":_ts(r["time"]),"position":"belowBar","color":"#00c864",
-                        "shape":"arrowUp","text":f"BUY {r['close']:.2f}","size":1})
+        markers.append({"time":_tv_time(r["time"]),"position":"belowBar",
+                        "color":"#00c864","shape":"arrowUp",
+                        "text":f"BUY {float(r['close']):.2f}","size":1})
     for _,r in sell_df.iterrows():
-        markers.append({"time":_ts(r["time"]),"position":"aboveBar","color":"#ef4444",
-                        "shape":"arrowDown","text":f"SELL {r['close']:.2f}","size":1})
+        markers.append({"time":_tv_time(r["time"]),"position":"aboveBar",
+                        "color":"#ef4444","shape":"arrowDown",
+                        "text":f"SELL {float(r['close']):.2f}","size":1})
     for _,r in exit_buy_df.iterrows():
-        markers.append({"time":_ts(r["time"]),"position":"aboveBar","color":"#fb923c",
-                        "shape":"arrowDown","text":f"EXIT {r['close']:.2f}","size":1})
+        markers.append({"time":_tv_time(r["time"]),"position":"aboveBar",
+                        "color":"#fb923c","shape":"arrowDown",
+                        "text":f"EXIT {float(r['close']):.2f}","size":1})
     for _,r in exit_sell_df.iterrows():
-        markers.append({"time":_ts(r["time"]),"position":"belowBar","color":"#fb923c",
-                        "shape":"arrowUp","text":f"EXIT {r['close']:.2f}","size":1})
-    # Sort markers by time
+        markers.append({"time":_tv_time(r["time"]),"position":"belowBar",
+                        "color":"#fb923c","shape":"arrowUp",
+                        "text":f"EXIT {float(r['close']):.2f}","size":1})
     markers.sort(key=lambda m: m["time"])
 
-    # ── 3. EMA series ───────────────────────────────────────────────────────
+    # ── 3. EMA lines ────────────────────────────────────────────────────────
     ema_series=[]
-    for col,color,width in [("EMA_8","#f59e0b",1.5),("EMA_21","#3b82f6",1.5),("EMA_50","#a855f7",1.5)]:
+    for col,color,width,title in [
+        ("EMA_8", "#f59e0b",1.5,"EMA8"),
+        ("EMA_21","#3b82f6",1.5,"EMA21"),
+        ("EMA_50","#a855f7",1.5,"EMA50"),
+    ]:
         if col in cdf.columns and cdf[col].notna().sum()>0:
             ema_series.append({
-                "type": Chart.Line,
-                "data": [{"time":_ts(r["Time"]),"value":round(float(r[col]),4)}
+                "type": "Line",
+                "data": [{"time":_tv_time(r["Time"]),"value":round(float(r[col]),4)}
                          for _,r in cdf.iterrows() if pd.notna(r[col])],
-                "options": {"color":color,"lineWidth":width,"priceLineVisible":False,
-                            "lastValueVisible":False,"crosshairMarkerVisible":False},
+                "options": {
+                    "color":color,"lineWidth":width,
+                    "priceLineVisible":False,"lastValueVisible":True,
+                    "crosshairMarkerVisible":False,"title":title,
+                },
             })
 
     # ── 4. VWAP ─────────────────────────────────────────────────────────────
     vwap_series=[]
     if has_vwap:
         vwap_series=[{
-            "type": Chart.Line,
-            "data": [{"time":_ts(r["Time"]),"value":round(float(r["VWAP"]),4)}
+            "type": "Line",
+            "data": [{"time":_tv_time(r["Time"]),"value":round(float(r["VWAP"]),4)}
                      for _,r in cdf.iterrows() if pd.notna(r["VWAP"])],
-            "options": {"color":"#06b6d4","lineWidth":1,"lineStyle":2,
-                        "priceLineVisible":False,"lastValueVisible":True,
-                        "crosshairMarkerVisible":False,"title":"VWAP"},
+            "options": {
+                "color":"#06b6d4","lineWidth":1,"lineStyle":2,
+                "priceLineVisible":False,"lastValueVisible":True,
+                "crosshairMarkerVisible":False,"title":"VWAP",
+            },
         }]
 
     # ── 5. Bollinger Bands ──────────────────────────────────────────────────
@@ -916,79 +997,91 @@ def make_tv_chart(df:pd.DataFrame, symbol:str, breakeven:Optional[float]=None):
     if has_bb:
         for col,title in [("BB_upper","BB+"),("BB_lower","BB-")]:
             bb_series.append({
-                "type": Chart.Line,
-                "data": [{"time":_ts(r["Time"]),"value":round(float(r[col]),4)}
+                "type": "Line",
+                "data": [{"time":_tv_time(r["Time"]),"value":round(float(r[col]),4)}
                          for _,r in cdf.iterrows() if pd.notna(r[col])],
-                "options": {"color":"rgba(139,92,246,0.45)","lineWidth":1,"lineStyle":2,
-                            "priceLineVisible":False,"lastValueVisible":False,
-                            "crosshairMarkerVisible":False,"title":title},
+                "options": {
+                    "color":"rgba(139,92,246,0.45)","lineWidth":1,"lineStyle":2,
+                    "priceLineVisible":False,"lastValueVisible":False,
+                    "crosshairMarkerVisible":False,"title":title,
+                },
             })
 
-    # ── 6. Breakeven line (as a price line via a dummy series point) ────────
-    # We'll add it as a horizontal line annotation using a Line series with
-    # a single point spanning the full range
+    # ── 6. Breakeven line ───────────────────────────────────────────────────
     be_series=[]
-    if breakeven is not None:
-        ts_start=_ts(cdf.iloc[0]["Time"]); ts_end=_ts(cdf.iloc[-1]["Time"])
+    if breakeven is not None and len(cdf)>=2:
+        ts_start=_tv_time(cdf.iloc[0]["Time"]); ts_end=_tv_time(cdf.iloc[-1]["Time"])
         be_series=[{
-            "type": Chart.Line,
-            "data": [{"time":ts_start,"value":round(breakeven,4)},
-                     {"time":ts_end,"value":round(breakeven,4)}],
-            "options": {"color":"#f59e0b","lineWidth":1,"lineStyle":1,
-                        "priceLineVisible":True,"lastValueVisible":True,
-                        "crosshairMarkerVisible":False,"title":f"BE ${breakeven:.2f}"},
+            "type": "Line",
+            "data": [{"time":ts_start,"value":round(float(breakeven),4)},
+                     {"time":ts_end,  "value":round(float(breakeven),4)}],
+            "options": {
+                "color":"#f59e0b","lineWidth":1,"lineStyle":1,
+                "priceLineVisible":True,"lastValueVisible":True,
+                "crosshairMarkerVisible":False,"title":f"BE ${breakeven:.2f}",
+            },
         }]
 
     # ── 7. Volume histogram ─────────────────────────────────────────────────
     vol_data=[]
     for _,r in cdf.iterrows():
         if pd.notna(r["Volume"]):
-            color="#00c86466" if r["Close"]>=r["Open"] else "#ef444466"
-            vol_data.append({"time":_ts(r["Time"]),"value":float(r["Volume"]),"color":color})
+            color="#00c86466" if float(r["Close"])>=float(r["Open"]) else "#ef444466"
+            vol_data.append({"time":_tv_time(r["Time"]),"value":float(r["Volume"]),"color":color})
 
     # ── 8. RSI + StochRSI ───────────────────────────────────────────────────
     rsi_data=[]; stoch_k_data=[]; stoch_d_data=[]
     if has_rsi:
-        rsi_data=[{"time":_ts(r["Time"]),"value":round(float(r["RSI"]),2)}
+        rsi_data=[{"time":_tv_time(r["Time"]),"value":round(float(r["RSI"]),2)}
                   for _,r in cdf.iterrows() if pd.notna(r["RSI"])]
         if "StochRSI_K" in cdf.columns:
-            stoch_k_data=[{"time":_ts(r["Time"]),"value":round(float(r["StochRSI_K"]),2)}
+            stoch_k_data=[{"time":_tv_time(r["Time"]),"value":round(float(r["StochRSI_K"]),2)}
                           for _,r in cdf.iterrows() if pd.notna(r["StochRSI_K"])]
-            stoch_d_data=[{"time":_ts(r["Time"]),"value":round(float(r["StochRSI_D"]),2)}
+        if "StochRSI_D" in cdf.columns:
+            stoch_d_data=[{"time":_tv_time(r["Time"]),"value":round(float(r["StochRSI_D"]),2)}
                           for _,r in cdf.iterrows() if pd.notna(r.get("StochRSI_D"))]
 
     # ── 9. MACD ─────────────────────────────────────────────────────────────
     macd_data=[]; macd_sig_data=[]; macd_hist_data=[]
     if has_macd:
-        macd_data=[{"time":_ts(r["Time"]),"value":round(float(r["MACD"]),6)}
+        macd_data=[{"time":_tv_time(r["Time"]),"value":round(float(r["MACD"]),6)}
                    for _,r in cdf.iterrows() if pd.notna(r["MACD"])]
-        macd_sig_data=[{"time":_ts(r["Time"]),"value":round(float(r["MACD_signal"]),6)}
+        macd_sig_data=[{"time":_tv_time(r["Time"]),"value":round(float(r["MACD_signal"]),6)}
                        for _,r in cdf.iterrows() if pd.notna(r["MACD_signal"])]
-        macd_hist_data=[{"time":_ts(r["Time"]),"value":round(float(r["MACD_hist"]),6),
-                         "color":"#00c86499" if r["MACD_hist"]>=0 else "#ef444499"}
-                        for _,r in cdf.iterrows() if pd.notna(r["MACD_hist"])]
+        macd_hist_data=[{
+            "time":_tv_time(r["Time"]),
+            "value":round(float(r["MACD_hist"]),6),
+            "color":"#00c86499" if float(r["MACD_hist"])>=0 else "#ef444499",
+        } for _,r in cdf.iterrows() if pd.notna(r["MACD_hist"])]
 
     # ── 10. TTM Squeeze ─────────────────────────────────────────────────────
     sq_hist_data=[]
     if has_squeeze:
-        sq_hist_data=[{"time":_ts(r["Time"]),"value":round(float(r["Squeeze_hist"]),6),
-                       "color":"#00c86499" if r["Squeeze_hist"]>=0 else "#ef444499"}
-                      for _,r in cdf.iterrows() if pd.notna(r["Squeeze_hist"])]
+        sq_hist_data=[{
+            "time":_tv_time(r["Time"]),
+            "value":round(float(r["Squeeze_hist"]),6),
+            "color":"#00c86499" if float(r["Squeeze_hist"])>=0 else "#ef444499",
+        } for _,r in cdf.iterrows() if pd.notna(r["Squeeze_hist"])]
 
     # ══════════════════════════════════════════════════════════════════════
-    # BUILD CHART LIST
+    # ASSEMBLE CHART LIST
+    # Series type MUST be a plain string ('Candlestick','Line','Histogram')
+    # NOT the Chart enum — the enum value is the method name, not the type key.
     # ══════════════════════════════════════════════════════════════════════
     charts=[]
 
-    # ── Panel 1: Price (candles + EMAs + VWAP + BB + breakeven) ────────────
+    # Panel 1 — Price
     price_series=[
         {
-            "type": Chart.Candlestick,
+            "type": "Candlestick",
             "data": candle_data,
             "options": {
-                "upColor":"#00c864","downColor":"#ef4444",
-                "borderUpColor":"#00c864","borderDownColor":"#ef4444",
-                "wickUpColor":"#00c864","wickDownColor":"#ef4444",
+                "upColor":       "#00c864",
+                "downColor":     "#ef4444",
+                "borderUpColor": "#00c864",
+                "borderDownColor":"#ef4444",
+                "wickUpColor":   "#00c864",
+                "wickDownColor": "#ef4444",
             },
             "markers": markers,
         },
@@ -997,72 +1090,65 @@ def make_tv_chart(df:pd.DataFrame, symbol:str, breakeven:Optional[float]=None):
         *bb_series,
         *be_series,
     ]
+    charts.append({"chart": {**_base, "height": 380}, "series": price_series})
 
-    charts.append({
-        "chart": {**_chart_opts, "height":380},
-        "series": price_series,
-    })
-
-    # ── Panel 2: Volume ─────────────────────────────────────────────────────
-    charts.append({
-        "chart": {**_chart_opts, "height":80},
-        "series": [{
-            "type": Chart.Histogram,
-            "data": vol_data,
-            "options": {"priceFormat":{"type":"volume"},"priceScaleId":"vol",
-                        "scaleMargins":{"top":0.1,"bottom":0}},
-        }],
-    })
-
-    # ── Panel 3: RSI + StochRSI ─────────────────────────────────────────────
-    if has_rsi:
-        rsi_panel_series=[
-            {"type":Chart.Line,"data":rsi_data,
-             "options":{"color":"#06b6d4","lineWidth":1.5,"priceLineVisible":False,
-                        "lastValueVisible":True,"title":"RSI"}},
-        ]
-        if stoch_k_data:
-            rsi_panel_series.append(
-                {"type":Chart.Line,"data":stoch_k_data,
-                 "options":{"color":"#f59e0b","lineWidth":1,"lineStyle":2,
-                            "priceLineVisible":False,"lastValueVisible":False,"title":"K"}})
-        if stoch_d_data:
-            rsi_panel_series.append(
-                {"type":Chart.Line,"data":stoch_d_data,
-                 "options":{"color":"#a855f7","lineWidth":1,"lineStyle":2,
-                            "priceLineVisible":False,"lastValueVisible":False,"title":"D"}})
+    # Panel 2 — Volume
+    if vol_data:
         charts.append({
-            "chart": {**_chart_opts, "height":120},
-            "series": rsi_panel_series,
-        })
-
-    # ── Panel 4: MACD ────────────────────────────────────────────────────────
-    if has_macd:
-        charts.append({
-            "chart": {**_chart_opts, "height":120},
-            "series": [
-                {"type":Chart.Histogram,"data":macd_hist_data,
-                 "options":{"priceLineVisible":False,"lastValueVisible":False,"title":"Hist"}},
-                {"type":Chart.Line,"data":macd_data,
-                 "options":{"color":"#3b82f6","lineWidth":1.4,"priceLineVisible":False,
-                            "lastValueVisible":True,"title":"MACD"}},
-                {"type":Chart.Line,"data":macd_sig_data,
-                 "options":{"color":"#f87171","lineWidth":1.4,"priceLineVisible":False,
-                            "lastValueVisible":True,"title":"Sig"}},
-            ],
-        })
-
-    # ── Panel 5: TTM Squeeze ─────────────────────────────────────────────────
-    if has_squeeze:
-        charts.append({
-            "chart": {**_chart_opts, "height":100},
+            "chart": {**_sub, "height": 80},
             "series": [{
-                "type":Chart.Histogram,"data":sq_hist_data,
-                "options":{"priceLineVisible":False,"lastValueVisible":False,"title":"Squeeze"},
+                "type": "Histogram",
+                "data": vol_data,
+                "options": {
+                    "priceFormat": {"type":"volume"},
+                    "priceScaleId": "vol",
+                    "scaleMargins": {"top":0.1,"bottom":0},
+                },
             }],
         })
 
-    renderLightweightCharts(charts=charts, key=f"tv_chart_{symbol}")
+    # Panel 3 — RSI + StochRSI
+    if has_rsi and rsi_data:
+        rsi_panel=[
+            {"type":"Line","data":rsi_data,
+             "options":{"color":"#06b6d4","lineWidth":1.5,
+                        "priceLineVisible":False,"lastValueVisible":True,"title":"RSI"}},
+        ]
+        if stoch_k_data:
+            rsi_panel.append({"type":"Line","data":stoch_k_data,
+                              "options":{"color":"#f59e0b","lineWidth":1,"lineStyle":2,
+                                         "priceLineVisible":False,"lastValueVisible":False,"title":"K"}})
+        if stoch_d_data:
+            rsi_panel.append({"type":"Line","data":stoch_d_data,
+                              "options":{"color":"#a855f7","lineWidth":1,"lineStyle":2,
+                                         "priceLineVisible":False,"lastValueVisible":False,"title":"D"}})
+        charts.append({"chart":{**_sub,"height":120},"series":rsi_panel})
+
+    # Panel 4 — MACD
+    if has_macd and macd_data:
+        charts.append({
+            "chart": {**_sub,"height":120},
+            "series": [
+                {"type":"Histogram","data":macd_hist_data,
+                 "options":{"priceLineVisible":False,"lastValueVisible":False,"title":"Hist"}},
+                {"type":"Line","data":macd_data,
+                 "options":{"color":"#3b82f6","lineWidth":1.4,
+                            "priceLineVisible":False,"lastValueVisible":True,"title":"MACD"}},
+                {"type":"Line","data":macd_sig_data,
+                 "options":{"color":"#f87171","lineWidth":1.4,
+                            "priceLineVisible":False,"lastValueVisible":True,"title":"Sig"}},
+            ],
+        })
+
+    # Panel 5 — TTM Squeeze
+    if has_squeeze and sq_hist_data:
+        charts.append({
+            "chart": {**_sub,"height":100},
+            "series": [{"type":"Histogram","data":sq_hist_data,
+                        "options":{"priceLineVisible":False,"lastValueVisible":False,"title":"Squeeze"}}],
+        })
+
+    renderLightweightCharts(charts=charts, key=f"tv_{symbol}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GUARD
@@ -1091,6 +1177,40 @@ with st.sidebar:
     tf          =st.selectbox("Primary timeframe",["1Min","5Min","15Min","1Hour"],index=1)
     qty         =st.number_input("Contracts",min_value=1,max_value=100,value=10,step=1)
     order_style =st.selectbox("Order type",["market","limit"])
+
+    st.divider()
+
+    # ── Account Size + Risk Calculator ─────────────────────────────────────
+    st.markdown("**💰 Account Risk Calculator**")
+    account_size = st.number_input(
+        "Account Size ($)",
+        min_value=1000.0, max_value=10_000_000.0,
+        value=float(st.session_state.get("account_size", 25000.0)),
+        step=500.0, format="%.0f", key="account_size"
+    )
+    risk_pct = st.slider(
+        "Risk per trade (%)",
+        min_value=0.25, max_value=5.0,
+        value=float(st.session_state.get("risk_pct", 1.0)),
+        step=0.25, format="%.2f%%", key="risk_pct"
+    )
+    max_risk_dollars = account_size * (risk_pct / 100.0)
+    max_contracts_est = max(1, int(max_risk_dollars / 100)) if max_risk_dollars >= 100 else 1
+
+    st.markdown(
+        f'<div class="risk-box">'
+        f'<div class="risk-label">Max Loss This Trade</div>'
+        f'<div class="risk-value">${max_risk_dollars:,.2f}</div>'
+        f'<div class="risk-sub">{risk_pct:.2f}% of ${account_size:,.0f}</div>'
+        f'</div>'
+        f'<div class="risk-box" style="margin-top:6px">'
+        f'<div class="risk-label">Est. Max Contracts</div>'
+        f'<div class="risk-value">{max_contracts_est}</div>'
+        f'<div class="risk-sub">at $100/contract stop loss</div>'
+        f'</div>',
+        unsafe_allow_html=True
+    )
+
     st.divider()
     enable_multi_tf=st.checkbox("Multi-timeframe confirmation",value=True)
     show_auto_pick =st.checkbox("Show smart contract picker",value=True)
@@ -1371,6 +1491,22 @@ r2.metric("TP1",         fmt_money(tp1))
 r3.metric("TP2",         fmt_money(tp2))
 r4.metric("R/R to TP1",  "N/A" if rr1 is None else f"{rr1:.2f}")
 r5.metric("R/R to TP2",  "N/A" if rr2 is None else f"{rr2:.2f}")
+
+# ── Risk vs Account Size callout ──────────────────────────────────────────────
+if entry_premium and entry_premium > 0 and not is_same_locked_trade:
+    trade_risk_total = entry_premium * (stop_pct / 100.0) * int(qty) * 100
+    pct_of_account   = (trade_risk_total / account_size * 100) if account_size > 0 else 0
+    risk_color = "#4ade80" if pct_of_account <= risk_pct else ("#f59e0b" if pct_of_account <= risk_pct * 1.5 else "#ef4444")
+    st.markdown(
+        f'<div style="background:#161b22;border:1px solid #30363d;border-radius:8px;'
+        f'padding:10px 16px;margin:8px 0;display:flex;gap:24px;align-items:center">'
+        f'<span style="color:#8b949e;font-size:.85rem">Trade risk ({qty} contracts):</span>'
+        f'<span style="color:{risk_color};font-weight:800;font-size:1.05rem">${trade_risk_total:,.2f}</span>'
+        f'<span style="color:{risk_color};font-size:.85rem">({pct_of_account:.2f}% of account)</span>'
+        f'<span style="color:#8b949e;font-size:.8rem">· Max allowed: ${max_risk_dollars:,.2f} ({risk_pct:.2f}%)</span>'
+        f'</div>',
+        unsafe_allow_html=True
+    )
 
 if is_same_locked_trade: st.success("🔒 Locked trade active. Trade Plan is frozen until cleared or closed.")
 if base_state in ["ENTER CALL","ENTER PUT"] and rr1 is not None and rr1<min_rr:
